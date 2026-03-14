@@ -1,0 +1,78 @@
+// =============================================================================
+// Strategy 5: Stochastic + EMA Trend Filter — GBP/JPY Backtesting Strategy
+// =============================================================================
+// Logic: Stochastic %K crosses above %D in oversold (<20) AND price > EMA(50) → Long
+//        Stochastic %K crosses below %D in overbought (>80) AND price < EMA(50) → Short
+// Risk:  Fixed stop loss (40 pips), take profit (80 pips) — 1:2 risk-reward
+// =============================================================================
+
+//@version=5
+strategy("Stochastic + EMA Trend | GBP/JPY", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1000,
+     commission_type=strategy.commission.percent, commission_value=0.01,
+     process_orders_on_close=false)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+stochK      = input.int(14, "Stochastic %K Length",  minval=1)
+stochSmooth = input.int(3,  "Stochastic %K Smooth",  minval=1)
+stochD      = input.int(3,  "Stochastic %D Smooth",  minval=1)
+obLevel     = input.int(80, "Overbought Level",      minval=50, maxval=100)
+osLevel     = input.int(20, "Oversold Level",         minval=0,  maxval=50)
+emaLen      = input.int(50, "EMA Trend Filter Length",minval=1)
+slPips      = input.float(40, "Stop Loss (pips)",     step=5)
+tpPips      = input.float(80, "Take Profit (pips)",   step=5)
+
+// ── Pip value for GBP/JPY ───────────────────────────────────────────────────
+pipSize = syminfo.mintick * 10
+
+// ── Calculations ────────────────────────────────────────────────────────────
+k = ta.sma(ta.stoch(close, high, low, stochK), stochSmooth)
+d = ta.sma(k, stochD)
+emaFilter = ta.ema(close, emaLen)
+
+// ── Signals ─────────────────────────────────────────────────────────────────
+bullishStoch = ta.crossover(k, d)  and k[1] < osLevel
+bearishStoch = ta.crossunder(k, d) and k[1] > obLevel
+
+longSignal  = bullishStoch and close > emaFilter
+shortSignal = bearishStoch and close < emaFilter
+
+// ── Entries & Exits ─────────────────────────────────────────────────────────
+if longSignal
+    sl = close - slPips * pipSize
+    tp = close + tpPips * pipSize
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP/SL", "Long", stop=sl, limit=tp)
+
+if shortSignal
+    sl = close + slPips * pipSize
+    tp = close - tpPips * pipSize
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP/SL", "Short", stop=sl, limit=tp)
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(emaFilter, "EMA Trend Filter", color=color.new(color.purple, 0), linewidth=2)
+
+plotshape(longSignal,  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, title="Buy Signal")
+plotshape(shortSignal, style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, title="Sell Signal")
+
+// ── Performance Summary Table ───────────────────────────────────────────────
+var table perfTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islastconfirmedhistory
+    table.cell(perfTable, 0, 0, "Metric",         text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 0, "Value",           text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 1, "Strategy",        text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 1, "Stoch + EMA",     text_color=color.yellow,text_size=size.small)
+    table.cell(perfTable, 0, 2, "Net Profit",      text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(strategy.netprofit, "#,##0.00") + " USD", text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 0, 3, "Total Trades",    text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(strategy.closedtrades),       text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 4, "Win Rate",        text_color=color.gray,  text_size=size.small)
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    table.cell(perfTable, 1, 4, str.tostring(winRate, "#0.1") + "%",       text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 5, "Profit Factor",   text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(strategy.grossprofit / math.max(strategy.grossloss, 1), "#0.00"), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 6, "Max Drawdown",    text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(strategy.max_drawdown, "#,##0.00") + " USD", text_color=color.red, text_size=size.small)

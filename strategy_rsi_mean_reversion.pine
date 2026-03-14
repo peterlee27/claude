@@ -1,0 +1,83 @@
+// =============================================================================
+// Strategy 2: RSI Mean Reversion — GBP/JPY Backtesting Strategy
+// =============================================================================
+// Logic: RSI(14) drops below 30 → Long; rises above 70 → Short
+//        Exit when RSI returns to 50
+// Risk:  Fixed stop loss (50 pips), take profit (100 pips) — 1:2 risk-reward
+// =============================================================================
+
+//@version=5
+strategy("RSI Mean Reversion | GBP/JPY", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1000,
+     commission_type=strategy.commission.percent, commission_value=0.01,
+     process_orders_on_close=false)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+rsiLen    = input.int(14,  "RSI Length",         minval=1)
+obLevel   = input.int(70,  "Overbought Level",  minval=50, maxval=100)
+osLevel   = input.int(30,  "Oversold Level",     minval=0,  maxval=50)
+midLevel  = input.int(50,  "Mid Level (Exit)",   minval=30, maxval=70)
+slPips    = input.float(50,  "Stop Loss (pips)",  step=5)
+tpPips    = input.float(100, "Take Profit (pips)", step=5)
+
+// ── Pip value for GBP/JPY (1 pip = 0.01) ────────────────────────────────────
+pipSize = syminfo.mintick * 10  // For JPY pairs: mintick=0.001, so pipSize=0.01
+
+// ── Calculations ────────────────────────────────────────────────────────────
+rsiVal = ta.rsi(close, rsiLen)
+
+// ── Signals ─────────────────────────────────────────────────────────────────
+longSignal  = ta.crossunder(rsiVal, osLevel)   // RSI crosses below 30
+shortSignal = ta.crossover(rsiVal, obLevel)    // RSI crosses above 70
+
+longExit  = ta.crossover(rsiVal, midLevel)     // RSI returns above 50
+shortExit = ta.crossunder(rsiVal, midLevel)    // RSI returns below 50
+
+// ── Entries & Exits ─────────────────────────────────────────────────────────
+if longSignal
+    sl = close - slPips * pipSize
+    tp = close + tpPips * pipSize
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP/SL", "Long", stop=sl, limit=tp)
+
+if shortSignal
+    sl = close + slPips * pipSize
+    tp = close - tpPips * pipSize
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP/SL", "Short", stop=sl, limit=tp)
+
+// RSI mid-level exits (close position if TP/SL hasn't triggered)
+if longExit and strategy.position_size > 0
+    strategy.close("Long", comment="RSI Mid Exit")
+
+if shortExit and strategy.position_size < 0
+    strategy.close("Short", comment="RSI Mid Exit")
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plotshape(longSignal,  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, title="Buy Signal")
+plotshape(shortSignal, style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, title="Sell Signal")
+
+// ── RSI Panel ───────────────────────────────────────────────────────────────
+// Note: RSI is visible in the strategy's data window. For a separate RSI pane,
+// users can add a standard RSI indicator alongside this strategy.
+
+// ── Performance Summary Table ───────────────────────────────────────────────
+var table perfTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islastconfirmedhistory
+    table.cell(perfTable, 0, 0, "Metric",         text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 0, "Value",           text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 1, "Strategy",        text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 1, "RSI Mean Revert", text_color=color.yellow,text_size=size.small)
+    table.cell(perfTable, 0, 2, "Net Profit",      text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(strategy.netprofit, "#,##0.00") + " USD", text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 0, 3, "Total Trades",    text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(strategy.closedtrades),       text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 4, "Win Rate",        text_color=color.gray,  text_size=size.small)
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    table.cell(perfTable, 1, 4, str.tostring(winRate, "#0.1") + "%",       text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 5, "Profit Factor",   text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(strategy.grossprofit / math.max(strategy.grossloss, 1), "#0.00"), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 6, "Max Drawdown",    text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(strategy.max_drawdown, "#,##0.00") + " USD", text_color=color.red, text_size=size.small)
