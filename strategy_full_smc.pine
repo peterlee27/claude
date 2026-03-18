@@ -1,0 +1,158 @@
+// =============================================================================
+// Strategy 5: AMD + Liquidity Sweep + Order Flow (Full SMC) — GBP/JPY
+// =============================================================================
+// Concept: The complete Smart Money model combining all three concepts:
+//
+//   1. AMD SESSION STRUCTURE: Use Asian range as accumulation zone
+//   2. LIQUIDITY SWEEP: Wait for London to sweep the Asian high/low
+//   3. ORDER FLOW CONFIRMATION: Verify with volume spike + delta alignment
+//
+// This is the highest-conviction strategy — it requires ALL three
+// confluences to align before entering, resulting in fewer but
+// higher-quality trades.
+//
+// Logic:   1. Track Asian session range (accumulation)
+//          2. Detect sweep of Asian range during London (manipulation)
+//          3. Confirm sweep with volume spike + favorable delta
+//          4. Enter distribution move with tight SL and 3:1 R:R
+// =============================================================================
+
+//@version=5
+strategy("Full SMC: AMD+Sweep+Flow | GBP/JPY", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1000,
+     commission_type=strategy.commission.percent, commission_value=0.01,
+     process_orders_on_close=false)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+// Session settings
+asianStart   = input.int(0,   "Asian Start (UTC hour)",      minval=0, maxval=23)
+asianEnd     = input.int(8,   "Asian End (UTC hour)",        minval=0, maxval=23)
+tradeEnd     = input.int(16,  "Trading Cutoff (UTC hour)",   minval=0, maxval=23)
+
+// Sweep settings
+sweepPips    = input.float(3,  "Min Sweep Beyond Range (pips)", step=1)
+slBuffer     = input.float(5,  "SL Buffer (pips)",             step=1)
+maxSlPips    = input.float(60, "Max Stop Loss (pips)",          step=5)
+rrRatio      = input.float(3.0, "Reward-to-Risk Ratio",        step=0.1)
+
+// Order flow settings
+volAvgLen    = input.int(20,   "Volume Average Length",      minval=5)
+volSpikeMult = input.float(1.5, "Volume Spike Multiplier",   step=0.1)
+deltaLen     = input.int(3,    "Delta Lookback",             minval=1)
+
+// ── Pip Calculation ─────────────────────────────────────────────────────────
+pipSize = syminfo.mintick * 10
+
+// ── Session Detection ───────────────────────────────────────────────────────
+currentHour = hour(time, "UTC")
+isAsian     = currentHour >= asianStart and currentHour < asianEnd
+isTradeTime = currentHour >= asianEnd   and currentHour < tradeEnd
+
+// ── Asian Range Tracking (Accumulation) ─────────────────────────────────────
+var float asianHigh   = na
+var float asianLow    = na
+var bool  rangeReady  = false
+var bool  tradedToday = false
+
+// Reset at Asian open
+if isAsian and not isAsian[1]
+    asianHigh   := high
+    asianLow    := low
+    rangeReady  := false
+    tradedToday := false
+
+// Build range
+if isAsian
+    asianHigh := math.max(asianHigh, high)
+    asianLow  := math.min(asianLow, low)
+
+// Lock range when Asian closes
+if not isAsian and isAsian[1]
+    rangeReady := true
+
+// ── Volume Delta (Order Flow) ───────────────────────────────────────────────
+candleRange = high - low
+buyVolume   = candleRange > 0 ? volume * (close - low) / candleRange : 0
+sellVolume  = candleRange > 0 ? volume * (high - close) / candleRange : 0
+delta       = buyVolume - sellVolume
+cumDelta    = math.sum(delta, deltaLen)
+
+avgVolume = ta.sma(volume, volAvgLen)
+volSpike  = volume > avgVolume * volSpikeMult
+
+// ── Full Confluence Signal ──────────────────────────────────────────────────
+minSweep = sweepPips * pipSize
+
+// LONG: Asian low swept + bullish reversal + volume spike + positive delta
+fullBullish = isTradeTime and rangeReady and not tradedToday and
+              low < asianLow - minSweep and       // swept Asian low
+              close > asianLow and                 // closed back above
+              close > open and                     // bullish candle
+              volSpike and                         // institutional volume
+              cumDelta > 0                         // buying pressure
+
+// SHORT: Asian high swept + bearish reversal + volume spike + negative delta
+fullBearish = isTradeTime and rangeReady and not tradedToday and
+              high > asianHigh + minSweep and      // swept Asian high
+              close < asianHigh and                // closed back below
+              close < open and                     // bearish candle
+              volSpike and                         // institutional volume
+              cumDelta < 0                         // selling pressure
+
+// ── Entries ─────────────────────────────────────────────────────────────────
+if fullBullish
+    slDistance = math.min(close - low + slBuffer * pipSize, maxSlPips * pipSize)
+    sl = close - slDistance
+    tp = close + slDistance * rrRatio
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+    tradedToday := true
+
+if fullBearish
+    slDistance = math.min(high - close + slBuffer * pipSize, maxSlPips * pipSize)
+    sl = close + slDistance
+    tp = close - slDistance * rrRatio
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+    tradedToday := true
+
+// End-of-day cleanup
+if currentHour >= tradeEnd and strategy.position_size != 0
+    strategy.close_all(comment="Session End")
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+asianHighPlot = plot(rangeReady ? asianHigh : na, "Asian High", color=color.new(color.red, 40),   style=plot.style_stepline, linewidth=2)
+asianLowPlot  = plot(rangeReady ? asianLow  : na, "Asian Low",  color=color.new(color.green, 40), style=plot.style_stepline, linewidth=2)
+fill(asianHighPlot, asianLowPlot, color=color.new(color.gray, 90), title="Asian Range")
+
+// Session backgrounds
+bgcolor(isAsian     ? color.new(color.blue, 95)   : na, title="Accumulation")
+bgcolor(isTradeTime ? color.new(color.orange, 97)  : na, title="Trade Window")
+
+// Signal markers
+plotshape(fullBullish, style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.normal, title="Full SMC Buy")
+plotshape(fullBearish, style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.normal, title="Full SMC Sell")
+
+// Volume spike markers (no trade)
+plotshape(volSpike and not fullBullish and not fullBearish and isTradeTime, style=shape.diamond, location=location.abovebar, color=color.new(color.yellow, 60), size=size.tiny, title="Vol Spike")
+
+// ── Performance Summary Table ───────────────────────────────────────────────
+var table perfTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islastconfirmedhistory
+    table.cell(perfTable, 0, 0, "Metric",             text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 1, 0, "Value",               text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 0, 1, "Strategy",            text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 1, "Full SMC",            text_color=color.yellow, text_size=size.small)
+    table.cell(perfTable, 0, 2, "Net Profit",          text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(strategy.netprofit, "#,##0.00") + " USD", text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 0, 3, "Total Trades",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 4, "Win Rate",            text_color=color.gray,   text_size=size.small)
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    table.cell(perfTable, 1, 4, str.tostring(winRate, "#0.1") + "%", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 5, "Profit Factor",       text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(strategy.grossprofit / math.max(strategy.grossloss, 1), "#0.00"), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 6, "Max Drawdown",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(strategy.max_drawdown, "#,##0.00") + " USD", text_color=color.red, text_size=size.small)

@@ -1,0 +1,104 @@
+// =============================================================================
+// Strategy 1: Liquidity Sweep — GBP/JPY Backtesting Strategy
+// =============================================================================
+// Concept: Price sweeps beyond recent swing highs/lows (grabbing stop-loss
+//          liquidity), then reverses. This exploits the institutional practice
+//          of hunting retail stop losses before the real move.
+//
+// Logic:   1. Identify swing highs/lows using pivot detection
+//          2. Wait for price to wick beyond a swing level (sweep)
+//          3. Enter on reversal candle confirmation (close back inside)
+//          4. Stop loss beyond the sweep wick, TP at opposing structure
+// =============================================================================
+
+//@version=5
+strategy("Liquidity Sweep | GBP/JPY", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1000,
+     commission_type=strategy.commission.percent, commission_value=0.01,
+     process_orders_on_close=false)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+pivotLeft   = input.int(5,    "Pivot Lookback Left",     minval=2)
+pivotRight  = input.int(2,    "Pivot Lookback Right",    minval=1)
+sweepBuffer = input.float(5,  "Sweep Buffer (pips)",     step=1)
+rrRatio     = input.float(2.5, "Reward-to-Risk Ratio",   step=0.1)
+atrLen      = input.int(14,   "ATR Length",              minval=1)
+maxSlPips   = input.float(80, "Max Stop Loss (pips)",    step=5)
+
+// ── Pip Calculation ─────────────────────────────────────────────────────────
+pipSize = syminfo.mintick * 10
+
+// ── Swing High/Low Detection ────────────────────────────────────────────────
+swingHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+swingLow  = ta.pivotlow(low, pivotLeft, pivotRight)
+
+// Track most recent swing levels
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+if not na(swingLow)
+    lastSwingLow := swingLow
+
+// ── Liquidity Sweep Detection ───────────────────────────────────────────────
+// Bearish sweep: price wicks ABOVE swing high but closes BELOW it
+sweepAbove = not na(lastSwingHigh) and
+             high > lastSwingHigh and
+             close < lastSwingHigh and
+             close < open  // bearish candle confirmation
+
+// Bullish sweep: price wicks BELOW swing low but closes ABOVE it
+sweepBelow = not na(lastSwingLow) and
+             low < lastSwingLow and
+             close > lastSwingLow and
+             close > open  // bullish candle confirmation
+
+// ── Risk Calculation ────────────────────────────────────────────────────────
+atrVal = ta.atr(atrLen)
+
+// ── Entries ─────────────────────────────────────────────────────────────────
+if sweepBelow
+    slDistance = math.min(close - low + sweepBuffer * pipSize, maxSlPips * pipSize)
+    sl = close - slDistance
+    tp = close + slDistance * rrRatio
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+    // Reset the swept level so we don't re-enter on same level
+    lastSwingLow := na
+
+if sweepAbove
+    slDistance = math.min(high - close + sweepBuffer * pipSize, maxSlPips * pipSize)
+    sl = close + slDistance
+    tp = close - slDistance * rrRatio
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+    lastSwingHigh := na
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(lastSwingHigh, "Swing High", color=color.new(color.red, 40),   style=plot.style_stepline, linewidth=1)
+plot(lastSwingLow,  "Swing Low",  color=color.new(color.green, 40), style=plot.style_stepline, linewidth=1)
+
+plotshape(sweepBelow, style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, title="Bullish Sweep")
+plotshape(sweepAbove, style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, title="Bearish Sweep")
+
+// ── Performance Summary Table ───────────────────────────────────────────────
+var table perfTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islastconfirmedhistory
+    table.cell(perfTable, 0, 0, "Metric",           text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 1, 0, "Value",             text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 0, 1, "Strategy",          text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 1, "Liquidity Sweep",   text_color=color.yellow, text_size=size.small)
+    table.cell(perfTable, 0, 2, "Net Profit",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(strategy.netprofit, "#,##0.00") + " USD", text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 0, 3, "Total Trades",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 4, "Win Rate",          text_color=color.gray,   text_size=size.small)
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    table.cell(perfTable, 1, 4, str.tostring(winRate, "#0.1") + "%", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 5, "Profit Factor",     text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(strategy.grossprofit / math.max(strategy.grossloss, 1), "#0.00"), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 6, "Max Drawdown",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(strategy.max_drawdown, "#,##0.00") + " USD", text_color=color.red, text_size=size.small)

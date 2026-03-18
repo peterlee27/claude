@@ -1,0 +1,115 @@
+// =============================================================================
+// Strategy 2: Order Flow Imbalance — GBP/JPY Backtesting Strategy
+// =============================================================================
+// Concept: Approximate institutional order flow using volume and price action.
+//          Detect buying/selling pressure imbalances through:
+//          - Volume spikes (institutional participation)
+//          - Candle body-to-wick ratio (absorption vs rejection)
+//          - Delta approximation (buying vs selling volume)
+//
+// Logic:   1. Estimate buy/sell volume using candle structure
+//          2. Detect volume spikes (>2x average = institutional activity)
+//          3. Identify absorption (large volume + small body = accumulation)
+//          4. Enter on imbalance confirmation with volume support
+// =============================================================================
+
+//@version=5
+strategy("Order Flow Imbalance | GBP/JPY", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1000,
+     commission_type=strategy.commission.percent, commission_value=0.01,
+     process_orders_on_close=false)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+volAvgLen      = input.int(20,   "Volume Average Length",     minval=5)
+volSpikeMult   = input.float(2.0, "Volume Spike Multiplier",  step=0.1)
+deltaLen       = input.int(3,    "Delta Lookback (bars)",     minval=1)
+absorptionPct  = input.float(30, "Absorption Body % (max)",   step=5, tooltip="Max body-to-range % for absorption candle")
+atrLen         = input.int(14,   "ATR Length",                minval=1)
+slMult         = input.float(1.5, "SL ATR Multiplier",        step=0.1)
+tpMult         = input.float(3.0, "TP ATR Multiplier",        step=0.1)
+emaFilterLen   = input.int(50,   "EMA Trend Filter",          minval=1)
+
+// ── Volume Delta Approximation ──────────────────────────────────────────────
+// Estimate buy/sell volume based on candle close position within range
+candleRange = high - low
+buyVolume   = candleRange > 0 ? volume * (close - low) / candleRange : 0
+sellVolume  = candleRange > 0 ? volume * (high - close) / candleRange : 0
+delta       = buyVolume - sellVolume
+
+// Cumulative delta over lookback
+cumDelta = math.sum(delta, deltaLen)
+
+// ── Volume Analysis ─────────────────────────────────────────────────────────
+avgVolume   = ta.sma(volume, volAvgLen)
+volSpike    = volume > avgVolume * volSpikeMult
+
+// ── Absorption Detection ────────────────────────────────────────────────────
+// Large volume + small body = institutional absorption (accumulation/distribution)
+bodySize    = math.abs(close - open)
+bodyPct     = candleRange > 0 ? bodySize / candleRange * 100 : 100
+isAbsorption = volSpike and bodyPct < absorptionPct
+
+// Bullish absorption: volume spike, small body, long lower wick (buying)
+lowerWick      = math.min(open, close) - low
+bullAbsorption = isAbsorption and lowerWick > bodySize * 2
+
+// Bearish absorption: volume spike, small body, long upper wick (selling)
+upperWick      = high - math.max(open, close)
+bearAbsorption = isAbsorption and upperWick > bodySize * 2
+
+// ── Trend Filter ────────────────────────────────────────────────────────────
+emaFilter = ta.ema(close, emaFilterLen)
+atrVal    = ta.atr(atrLen)
+
+// ── Signals ─────────────────────────────────────────────────────────────────
+// Bullish: buying absorption + positive cumulative delta + price near/above EMA
+longSignal = bullAbsorption and cumDelta > 0 and close >= emaFilter * 0.998
+
+// Bearish: selling absorption + negative cumulative delta + price near/below EMA
+shortSignal = bearAbsorption and cumDelta < 0 and close <= emaFilter * 1.002
+
+// ── Entries & Exits ─────────────────────────────────────────────────────────
+if longSignal
+    sl = close - atrVal * slMult
+    tp = close + atrVal * tpMult
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+
+if shortSignal
+    sl = close + atrVal * slMult
+    tp = close - atrVal * tpMult
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(emaFilter, "EMA Filter", color=color.new(color.purple, 0), linewidth=2)
+
+// Volume spike markers
+plotshape(volSpike and not longSignal and not shortSignal, style=shape.diamond, location=location.abovebar, color=color.new(color.yellow, 40), size=size.tiny, title="Vol Spike")
+
+plotshape(longSignal,  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, title="Buy: Order Flow")
+plotshape(shortSignal, style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, title="Sell: Order Flow")
+
+// ── Volume Delta Histogram (background) ─────────────────────────────────────
+bgcolor(cumDelta > 0 ? color.new(color.green, 95) : color.new(color.red, 95), title="Delta Bias")
+
+// ── Performance Summary Table ───────────────────────────────────────────────
+var table perfTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islastconfirmedhistory
+    table.cell(perfTable, 0, 0, "Metric",            text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 1, 0, "Value",              text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 0, 1, "Strategy",           text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 1, "Order Flow",         text_color=color.yellow, text_size=size.small)
+    table.cell(perfTable, 0, 2, "Net Profit",         text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(strategy.netprofit, "#,##0.00") + " USD", text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 0, 3, "Total Trades",       text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 4, "Win Rate",           text_color=color.gray,   text_size=size.small)
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    table.cell(perfTable, 1, 4, str.tostring(winRate, "#0.1") + "%", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 5, "Profit Factor",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(strategy.grossprofit / math.max(strategy.grossloss, 1), "#0.00"), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 0, 6, "Max Drawdown",       text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(strategy.max_drawdown, "#,##0.00") + " USD", text_color=color.red, text_size=size.small)
