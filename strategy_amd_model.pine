@@ -19,7 +19,7 @@
 //          4. TP at 2–3x the Asian range, SL beyond sweep wick
 // =============================================================================
 
-//@version=5
+//@version=6
 strategy("AMD Session Model | GBP/JPY", overlay=true,
      initial_capital=10000, currency=currency.USD,
      default_qty_type=strategy.fixed, default_qty_value=1000,

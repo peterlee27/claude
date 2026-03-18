@@ -11,7 +11,7 @@
 //          4. Stop loss beyond the sweep wick, TP at opposing structure
 // =============================================================================
 
-//@version=5
+//@version=6
 strategy("Liquidity Sweep | GBP/JPY", overlay=true,
      initial_capital=10000, currency=currency.USD,
      default_qty_type=strategy.fixed, default_qty_value=1000,

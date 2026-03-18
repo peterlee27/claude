@@ -13,7 +13,7 @@
 //          4. Enter on imbalance confirmation with volume support
 // =============================================================================
 
-//@version=5
+//@version=6
 strategy("Order Flow Imbalance | GBP/JPY", overlay=true,
      initial_capital=10000, currency=currency.USD,
      default_qty_type=strategy.fixed, default_qty_value=1000,

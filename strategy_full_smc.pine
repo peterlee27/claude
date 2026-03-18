@@ -17,7 +17,7 @@
 //          4. Enter distribution move with tight SL and 3:1 R:R
 // =============================================================================
 
-//@version=5
+//@version=6
 strategy("Full SMC: AMD+Sweep+Flow | GBP/JPY", overlay=true,
      initial_capital=10000, currency=currency.USD,
      default_qty_type=strategy.fixed, default_qty_value=1000,
