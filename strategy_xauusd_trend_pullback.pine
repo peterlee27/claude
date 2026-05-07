@@ -117,13 +117,11 @@ pullbackToEmaLong  = low  <= entryEma + pullbackAtrR * atrVal
 pullbackToEmaShort = high >= entryEma - pullbackAtrR * atrVal
 
 // Confirmation candle: bullish/bearish engulfing or strong reversal
-bullishEngulf = close > open and close[1] < open[1] and
-                close >= open[1] and open <= close[1]
-bullishHammer = close > open and (math.min(open, close) - low) > math.abs(close - open) * 1.5
+bullishEngulf = (close > open and close[1] < open[1] and close >= open[1] and open <= close[1])
+bullishHammer = (close > open and (math.min(open, close) - low) > math.abs(close - open) * 1.5)
 
-bearishEngulf = close < open and close[1] > open[1] and
-                close <= open[1] and open >= close[1]
-bearishStar   = close < open and (high - math.max(open, close)) > math.abs(close - open) * 1.5
+bearishEngulf = (close < open and close[1] > open[1] and close <= open[1] and open >= close[1])
+bearishStar   = (close < open and (high - math.max(open, close)) > math.abs(close - open) * 1.5)
 
 bullishCandle = useEngulfing ? (bullishEngulf or bullishHammer) : (close > open)
 bearishCandle = useEngulfing ? (bearishEngulf or bearishStar)   : (close < open)
@@ -164,16 +162,16 @@ if shortSignal
     strategy.entry("Short", strategy.short)
     strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
 
-// ── Trailing Stop After Initial TP ──────────────────────────────────────────
+// ── Trailing Stop Management ────────────────────────────────────────────────
+// Once price moves past initial TP level, replace fixed exit with trailing stop.
+// We replace the same exit ID so there's no conflict with the initial exit.
 if useTrailing and strategy.position_size > 0
-    // Detect if we've passed initial TP (track price reaching tpPrice)
     if not longHitTp1 and high >= longTpPrice
         longHitTp1 := true
     if longHitTp1
-        // Trail with ATR
         newTrail = close - trailAtrMult * atrVal
         longStopPrice := math.max(longStopPrice, newTrail)
-        strategy.exit("Long Trail", "Long", stop=longStopPrice)
+        strategy.exit("Long Exit", "Long", stop=longStopPrice)
 
 if useTrailing and strategy.position_size < 0
     if not shortHitTp1 and low <= shortTpPrice
@@ -181,7 +179,7 @@ if useTrailing and strategy.position_size < 0
     if shortHitTp1
         newTrail = close + trailAtrMult * atrVal
         shortStopPrice := math.min(shortStopPrice, newTrail)
-        strategy.exit("Short Trail", "Short", stop=shortStopPrice)
+        strategy.exit("Short Exit", "Short", stop=shortStopPrice)
 
 // Close trades when leaving test window (avoid OOS contamination)
 if not inTestRange and strategy.position_size != 0
