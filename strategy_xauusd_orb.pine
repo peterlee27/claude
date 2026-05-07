@@ -1,0 +1,347 @@
+// =============================================================================
+// Strategy 8: XAU/USD Daily Opening Range Breakout (ORB)
+// =============================================================================
+// Concept: Trade the breakout of the first hour of each major session.
+//          The "opening range" represents early participant positioning.
+//          When price breaks this range, it usually continues because
+//          institutional flow is committed to that direction.
+//
+// Two trade windows per day (1-2 trades/day target):
+//
+//   1. LONDON ORB
+//      Range: 07:00-08:00 UTC (first hour of London)
+//      Trade window: 08:00-12:00 UTC
+//
+//   2. NY ORB
+//      Range: 13:00-14:00 UTC (first hour of NY)
+//      Trade window: 14:00-21:00 UTC
+//
+// Filters:
+//   - Daily EMA50 trend bias (only trade WITH the daily trend)
+//   - Minimum range size (skip dead days where range is tiny)
+//   - Maximum 1 trade per session, 2 per day
+//
+// Risk:
+//   - SL: opposite side of opening range + 0.3 ATR buffer
+//   - TP: configurable R:R (default 2:1)
+//   - End-of-day flat at 21:00 UTC (no overnight risk)
+//
+// Best timeframe: 15m or 30m (need granularity for entry timing)
+// Walk-forward testing built in.
+// =============================================================================
+
+//@version=6
+strategy("XAU/USD Daily ORB", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.02,
+     process_orders_on_close=false,
+     calc_on_every_tick=false)
+
+// ── Walk-Forward Inputs ─────────────────────────────────────────────────────
+grpWFA        = "Walk-Forward Testing"
+inSampleStart = input.time(timestamp("2020-01-01T00:00:00"), "In-Sample Start", group=grpWFA)
+inSampleEnd   = input.time(timestamp("2024-01-01T00:00:00"), "In-Sample End / OOS Start", group=grpWFA)
+testEnd       = input.time(timestamp("2026-12-31T23:59:59"), "Test End",        group=grpWFA)
+
+// ── Session Inputs (UTC) ────────────────────────────────────────────────────
+grpSession        = "Session Times (UTC)"
+londonRangeStart  = input.int(7,  "London Range Start",  minval=0, maxval=23, group=grpSession)
+londonRangeEnd    = input.int(8,  "London Range End",    minval=0, maxval=23, group=grpSession)
+londonTradeEnd    = input.int(12, "London Trade Window End", minval=0, maxval=23, group=grpSession)
+nyRangeStart      = input.int(13, "NY Range Start",      minval=0, maxval=23, group=grpSession)
+nyRangeEnd        = input.int(14, "NY Range End",        minval=0, maxval=23, group=grpSession)
+nyTradeEnd        = input.int(21, "NY Trade Window End / Flat", minval=0, maxval=23, group=grpSession)
+enableLondon      = input.bool(true, "Trade London ORB", group=grpSession)
+enableNY          = input.bool(true, "Trade NY ORB",     group=grpSession)
+
+// ── Trend Filter ────────────────────────────────────────────────────────────
+grpTrend          = "Daily Trend Filter"
+useTrendFilter    = input.bool(true, "Use Daily EMA Bias",  group=grpTrend)
+dailyEmaLen       = input.int(50,    "Daily EMA Length",    minval=5, group=grpTrend)
+allowCounterTrend = input.bool(false, "Allow Counter-Trend Trades (riskier)", group=grpTrend)
+
+// ── Range / Risk ────────────────────────────────────────────────────────────
+grpRisk           = "Range & Risk Management"
+atrLen            = input.int(14,    "ATR Length",                  minval=1, group=grpRisk)
+minRangeAtr       = input.float(0.3, "Min Range Size (ATR units)",  step=0.05, group=grpRisk,
+                                tooltip="Skip days where opening range is < this many ATRs (dead market)")
+slBufferAtr       = input.float(0.3, "SL Buffer Beyond Range (ATR)",step=0.05, group=grpRisk)
+tpRrRatio         = input.float(2.0, "Take Profit (R:R)",           step=0.1, group=grpRisk)
+useTrailing       = input.bool(false, "Trail After 1R Hit",         group=grpRisk)
+trailAtrMult      = input.float(1.5, "Trail Distance (ATR)",        step=0.1, group=grpRisk)
+
+// ── Walk-Forward Period Detection ───────────────────────────────────────────
+inSample    = time >= inSampleStart and time < inSampleEnd
+outOfSample = time >= inSampleEnd   and time < testEnd
+inTestRange = inSample or outOfSample
+
+// ── Time / Session Detection ────────────────────────────────────────────────
+currentHour = hour(time, "UTC")
+
+inLondonRange  = currentHour >= londonRangeStart and currentHour < londonRangeEnd
+inLondonTrade  = currentHour >= londonRangeEnd   and currentHour < londonTradeEnd
+inNyRange      = currentHour >= nyRangeStart     and currentHour < nyRangeEnd
+inNyTrade      = currentHour >= nyRangeEnd       and currentHour < nyTradeEnd
+
+// ── Daily Trend Filter ──────────────────────────────────────────────────────
+dailyEma = request.security(syminfo.tickerid, "D",
+                            ta.ema(close, dailyEmaLen),
+                            lookahead=barmerge.lookahead_off)
+
+trendBullish = useTrendFilter ? (not na(dailyEma) and close > dailyEma) : true
+trendBearish = useTrendFilter ? (not na(dailyEma) and close < dailyEma) : true
+
+// ── ATR ─────────────────────────────────────────────────────────────────────
+atrVal = ta.atr(atrLen)
+
+// ── Track Opening Ranges ────────────────────────────────────────────────────
+var float londonHigh   = na
+var float londonLow    = na
+var bool  londonReady  = false
+var bool  londonTraded = false
+
+var float nyHigh   = na
+var float nyLow    = na
+var bool  nyReady  = false
+var bool  nyTraded = false
+
+// Reset both sessions at 00:00 UTC each day
+newDay = ta.change(time("D")) != 0
+if newDay
+    londonHigh   := na
+    londonLow    := na
+    londonReady  := false
+    londonTraded := false
+    nyHigh       := na
+    nyLow        := na
+    nyReady      := false
+    nyTraded     := false
+
+// Build London opening range
+if inLondonRange
+    londonHigh := na(londonHigh) ? high : math.max(londonHigh, high)
+    londonLow  := na(londonLow)  ? low  : math.min(londonLow, low)
+
+// Lock London range when window closes
+if not inLondonRange and inLondonRange[1]
+    londonReady := true
+
+// Build NY opening range
+if inNyRange
+    nyHigh := na(nyHigh) ? high : math.max(nyHigh, high)
+    nyLow  := na(nyLow)  ? low  : math.min(nyLow, low)
+
+// Lock NY range when window closes
+if not inNyRange and inNyRange[1]
+    nyReady := true
+
+// ── Range Validity Check ────────────────────────────────────────────────────
+londonRangeSize = londonHigh - londonLow
+nyRangeSize     = nyHigh - nyLow
+londonRangeOk   = londonReady and londonRangeSize >= minRangeAtr * atrVal
+nyRangeOk       = nyReady     and nyRangeSize     >= minRangeAtr * atrVal
+
+// ── Breakout Detection ──────────────────────────────────────────────────────
+// London breakouts (during London trade window only)
+londonBreakUp   = enableLondon and inLondonTrade and londonRangeOk and not londonTraded and
+                  close > londonHigh and (allowCounterTrend or trendBullish)
+londonBreakDown = enableLondon and inLondonTrade and londonRangeOk and not londonTraded and
+                  close < londonLow  and (allowCounterTrend or trendBearish)
+
+// NY breakouts (during NY trade window only)
+nyBreakUp   = enableNY and inNyTrade and nyRangeOk and not nyTraded and
+              close > nyHigh and (allowCounterTrend or trendBullish)
+nyBreakDown = enableNY and inNyTrade and nyRangeOk and not nyTraded and
+              close < nyLow  and (allowCounterTrend or trendBearish)
+
+// Combined long/short signals
+longSignal  = inTestRange and (londonBreakUp   or nyBreakUp)
+shortSignal = inTestRange and (londonBreakDown or nyBreakDown)
+
+// ── Entries ─────────────────────────────────────────────────────────────────
+var float curStop  = na
+var float curTp    = na
+var bool  hit1R    = false
+
+if longSignal
+    rangeRef = londonBreakUp ? londonLow  : nyLow
+    sl       = rangeRef - slBufferAtr * atrVal
+    risk     = close - sl
+    tp       = close + risk * tpRrRatio
+    curStop  := sl
+    curTp    := tp
+    hit1R    := false
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+    if londonBreakUp
+        londonTraded := true
+    if nyBreakUp
+        nyTraded := true
+
+if shortSignal
+    rangeRef = londonBreakDown ? londonHigh : nyHigh
+    sl       = rangeRef + slBufferAtr * atrVal
+    risk     = sl - close
+    tp       = close - risk * tpRrRatio
+    curStop  := sl
+    curTp    := tp
+    hit1R    := false
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+    if londonBreakDown
+        londonTraded := true
+    if nyBreakDown
+        nyTraded := true
+
+// ── Optional Trailing Stop After 1R ─────────────────────────────────────────
+if useTrailing and strategy.position_size > 0
+    longEntry = strategy.position_avg_price
+    risk = longEntry - curStop
+    if not hit1R and high >= longEntry + risk
+        hit1R := true
+    if hit1R
+        newTrail = close - trailAtrMult * atrVal
+        curStop := math.max(curStop, newTrail)
+        strategy.exit("Long Exit", "Long", stop=curStop)
+
+if useTrailing and strategy.position_size < 0
+    shortEntry = strategy.position_avg_price
+    risk = curStop - shortEntry
+    if not hit1R and low <= shortEntry - risk
+        hit1R := true
+    if hit1R
+        newTrail = close + trailAtrMult * atrVal
+        curStop := math.min(curStop, newTrail)
+        strategy.exit("Short Exit", "Short", stop=curStop)
+
+// ── End-of-Day Flatten (no overnight risk) ──────────────────────────────────
+if currentHour >= nyTradeEnd and strategy.position_size != 0
+    strategy.close_all(comment="EOD Flat")
+
+// Close trades when leaving test window
+if not inTestRange and strategy.position_size != 0
+    strategy.close_all(comment="Out of test window")
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(londonReady ? londonHigh : na, "London High",
+     color=color.new(color.blue, 30),  style=plot.style_linebr, linewidth=2)
+plot(londonReady ? londonLow  : na, "London Low",
+     color=color.new(color.blue, 30),  style=plot.style_linebr, linewidth=2)
+plot(nyReady ? nyHigh : na, "NY High",
+     color=color.new(color.orange, 30), style=plot.style_linebr, linewidth=2)
+plot(nyReady ? nyLow  : na, "NY Low",
+     color=color.new(color.orange, 30), style=plot.style_linebr, linewidth=2)
+
+plot(useTrendFilter and not na(dailyEma) ? dailyEma : na, "Daily EMA",
+     color=color.new(color.purple, 30), linewidth=1, style=plot.style_circles)
+
+// Session backgrounds
+bgcolor(inLondonRange ? color.new(color.blue, 95)    : na, title="London Range")
+bgcolor(inNyRange     ? color.new(color.orange, 95)  : na, title="NY Range")
+bgcolor(outOfSample   ? color.new(color.purple, 92)  : na, title="Out-of-Sample")
+
+// Signal markers
+plotshape(longSignal,  style=shape.triangleup,   location=location.belowbar,
+          color=color.green, size=size.normal, title="ORB Buy")
+plotshape(shortSignal, style=shape.triangledown, location=location.abovebar,
+          color=color.red,   size=size.normal, title="ORB Sell")
+
+// ── Walk-Forward Performance Table ──────────────────────────────────────────
+var table perfTable = table.new(position.top_right, 3, 10,
+                                bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islastconfirmedhistory
+    float isProfit  = 0.0
+    int   isTrades  = 0
+    int   isWins    = 0
+    float isGrossW  = 0.0
+    float isGrossL  = 0.0
+    float oosProfit = 0.0
+    int   oosTrades = 0
+    int   oosWins   = 0
+    float oosGrossW = 0.0
+    float oosGrossL = 0.0
+
+    for i = 0 to strategy.closedtrades - 1
+        entryT = strategy.closedtrades.entry_time(i)
+        profit = strategy.closedtrades.profit(i)
+
+        if entryT < inSampleEnd
+            isProfit  += profit
+            isTrades  += 1
+            if profit > 0
+                isWins += 1
+                isGrossW += profit
+            else
+                isGrossL += math.abs(profit)
+        else
+            oosProfit += profit
+            oosTrades += 1
+            if profit > 0
+                oosWins += 1
+                oosGrossW += profit
+            else
+                oosGrossL += math.abs(profit)
+
+    isWinRate  = isTrades  > 0 ? isWins  / isTrades  * 100 : 0.0
+    oosWinRate = oosTrades > 0 ? oosWins / oosTrades * 100 : 0.0
+    isPF       = isGrossL  > 0 ? isGrossW  / isGrossL  : (isGrossW  > 0 ? 999.0 : 0.0)
+    oosPF      = oosGrossL > 0 ? oosGrossW / oosGrossL : (oosGrossW > 0 ? 999.0 : 0.0)
+
+    // Trades per day estimate (rough)
+    avgTradesPerDay = (isTrades + oosTrades) / math.max(1, (testEnd - inSampleStart) / 86400000)
+
+    table.cell(perfTable, 0, 0, "Metric",        text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 1, 0, "In-Sample",     text_color=color.lime,   text_size=size.small)
+    table.cell(perfTable, 2, 0, "Out-of-Sample", text_color=color.aqua,   text_size=size.small)
+
+    table.cell(perfTable, 0, 1, "Strategy",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 1, "Daily ORB",     text_color=color.yellow, text_size=size.small)
+    table.cell(perfTable, 2, 1, "WFA",           text_color=color.yellow, text_size=size.small)
+
+    table.cell(perfTable, 0, 2, "Trades",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(isTrades),  text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 2, 2, str.tostring(oosTrades), text_color=color.white, text_size=size.small)
+
+    table.cell(perfTable, 0, 3, "Win Rate",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(isWinRate,  "#0.1") + "%",
+               text_color=isWinRate  >= 50 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 3, str.tostring(oosWinRate, "#0.1") + "%",
+               text_color=oosWinRate >= 50 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 4, "Net Profit",    text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 4, str.tostring(isProfit,  "#,##0.00"),
+               text_color=isProfit  >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 4, str.tostring(oosProfit, "#,##0.00"),
+               text_color=oosProfit >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 5, "Profit Factor", text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(isPF,  "#0.00"),
+               text_color=isPF  >= 1.5 ? color.green : (isPF  >= 1.0 ? color.yellow : color.red), text_size=size.small)
+    table.cell(perfTable, 2, 5, str.tostring(oosPF, "#0.00"),
+               text_color=oosPF >= 1.5 ? color.green : (oosPF >= 1.0 ? color.yellow : color.red), text_size=size.small)
+
+    isRoi  = isProfit  / strategy.initial_capital * 100
+    oosRoi = oosProfit / strategy.initial_capital * 100
+    table.cell(perfTable, 0, 6, "ROI %",         text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(isRoi,  "#0.00") + "%",
+               text_color=isRoi  >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 6, str.tostring(oosRoi, "#0.00") + "%",
+               text_color=oosRoi >= 0 ? color.green : color.red, text_size=size.small)
+
+    wfaRatio = isPF > 0 ? oosPF / isPF * 100 : 0.0
+    wfaVerdict = wfaRatio >= 70 ? "STRONG EDGE" : wfaRatio >= 50 ? "VIABLE" : wfaRatio > 0 ? "OVERFIT" : "NO OOS DATA"
+    wfaColor   = wfaRatio >= 70 ? color.green : wfaRatio >= 50 ? color.yellow : color.red
+    table.cell(perfTable, 0, 7, "WFA Health",    text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 7, str.tostring(wfaRatio, "#0.0") + "%", text_color=wfaColor, text_size=size.small)
+    table.cell(perfTable, 2, 7, wfaVerdict,                            text_color=wfaColor, text_size=size.small)
+
+    table.cell(perfTable, 0, 8, "Trades / Day",  text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 8, str.tostring(avgTradesPerDay, "#0.00"),  text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 2, 8, "(target: 1-2)", text_color=color.gray,   text_size=size.small)
+
+    table.cell(perfTable, 0, 9, "Max DD",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 9, str.tostring(strategy.max_drawdown, "#,##0.00"),
+               text_color=color.red, text_size=size.small)
+    table.cell(perfTable, 2, 9, "(combined)",    text_color=color.gray,   text_size=size.small)
