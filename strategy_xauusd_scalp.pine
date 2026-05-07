@@ -1,39 +1,42 @@
 // =============================================================================
-// Strategy 9: XAU/USD 5m Scalping — EMA Pullback (Singapore Session)
+// Strategy 9: XAU/USD 5m Scalping — Mean-Reversion Fade (Singapore Session)
 // =============================================================================
-// Concept: Trend-following micro-scalps on the 5m chart during Singapore hours.
-//          When higher-TF trend is up, scalp pullbacks to fast EMA. Mirror for
-//          shorts. Tight SL, 1:1.5 R:R, exit fast.
+// Concept: Asian session is statistically the quietest gold session (avg range
+//          ~0.3% vs ~0.7% London). It tends to RANGE, not trend. So we trade
+//          WITH that behavior: fade extremes. Sell tops, buy bottoms.
 //
 // Setup:
-//   - 5m EMA9 / EMA21 define short-term trend
-//   - 1H EMA50 defines higher-TF bias (must align)
-//   - Pullback: price wicks to EMA21 within last 5 bars
-//   - Trigger: 5m bar closes back above/below EMA9 with momentum
+//   - 5m Bollinger Band (20, 2.0 SD)
+//   - 5m RSI(14): <25 oversold, >75 overbought
+//   - 1H ADX(14) < 25 = range regime filter (skip if 1H is trending)
+//   - Reversal candle confirmation (avoid knife-catching)
 //
-// Session: Singapore (01:00-09:00 UTC) — Asian liquidity, gold tends to range
-//          but also trends cleanly during Tokyo data releases.
+// Logic:
+//   LONG  = price wicks below lower BB AND RSI < 25 AND bullish reversal candle
+//           AND 1H ADX < 25 (we're in a range, not a trend)
+//   SHORT = mirror
 //
-// Filters:
-//   - No trades in first 15 min after session open  (spread/slippage)
-//   - No trades in last 30 min before session close (closing volatility)
-//   - No trades in last 10 min of any hour          (hourly close noise)
-//   - ATR spike block (current ATR > 2x avg ATR)    (news event)
-//   - ATR floor (skip if ATR too low)               (dead market / fakes)
-//   - Hardcoded high-impact news windows            (NFP, FOMC, BOJ, CPI)
-//   - Manual news day blocker (comma-separated dates)
+// Session: Singapore 01:00-09:00 UTC (UTC+8 = SGT 09:00-17:00)
+//
+// Filters (carried from previous version):
+//   - Skip first 15min after open + last 30min before close
+//   - Skip last 10min of every hour
+//   - ATR spike block (news in progress)
+//   - ATR floor (skip dead vol)
+//   - Hardcoded NFP/CPI/BOJ time windows
+//   - Manual news day blocker (YYYY-MM-DD list)
 //
 // Risk:
-//   - SL: entry ± (ATR × slMult)
-//   - TP: 1.5R fixed (no trailing — scalps are in/out fast)
-//   - Position: 1 oz (= 0.01 lot equivalent for retail brokers)
-//   - Expected ~$10 risk per trade with default ATR settings
+//   - SL: beyond wick + ATR buffer (tight — fade trades fail fast)
+//   - TP1: BB middle band (mean) → close half
+//   - TP2: opposite BB → close rest (or 1:1.5R, whichever first)
+//   - Position: 1 oz, ~$10 risk per trade with default settings
 //
-// Walk-forward testing built in (IS / OOS split + WFA Health verdict).
+// Walk-forward IS/OOS testing built in.
 // =============================================================================
 
 //@version=6
-strategy("XAU/USD 5m Scalp | EMA Pullback", overlay=true,
+strategy("XAU/USD 5m Scalp | Mean Reversion", overlay=true,
      initial_capital=10000, currency=currency.USD,
      default_qty_type=strategy.fixed, default_qty_value=1,
      commission_type=strategy.commission.percent, commission_value=0.02,
@@ -47,154 +50,161 @@ inSampleStart = input.time(timestamp("2020-01-01T00:00:00"), "In-Sample Start", 
 inSampleEnd   = input.time(timestamp("2024-01-01T00:00:00"), "IS End / OOS Start", group=grpWFA)
 testEnd       = input.time(timestamp("2026-12-31T23:59:59"), "Test End",          group=grpWFA)
 
-// ── Session Inputs (Singapore = UTC+8, so SGT 09:00-17:00 = UTC 01:00-09:00) ─
+// ── Session ─────────────────────────────────────────────────────────────────
 grpSession        = "Singapore Session (UTC)"
 sessionStart      = input.int(1, "Session Start Hour (UTC)", minval=0, maxval=23, group=grpSession,
                               tooltip="01:00 UTC = 09:00 Singapore")
-sessionEnd        = input.int(9, "Session End Hour (UTC)",   minval=0, maxval=23, group=grpSession,
-                              tooltip="09:00 UTC = 17:00 Singapore")
+sessionEnd        = input.int(9, "Session End Hour (UTC)",   minval=0, maxval=23, group=grpSession)
 openBufferMin     = input.int(15, "Skip First N Minutes",   minval=0, group=grpSession)
 closeBufferMin    = input.int(30, "Skip Last N Minutes",    minval=0, group=grpSession)
-hourCloseBlockMin = input.int(10, "Block Last N Min of Each Hour", minval=0, maxval=59, group=grpSession)
+hourCloseBlockMin = input.int(10, "Block Last N Min of Hour", minval=0, maxval=59, group=grpSession)
 
-// ── EMA Setup ───────────────────────────────────────────────────────────────
-grpEma           = "EMA Setup"
-fastLen          = input.int(9,  "Fast EMA (5m)",          minval=2, group=grpEma)
-slowLen          = input.int(21, "Slow EMA (5m)",          minval=2, group=grpEma)
-htfBiasLen       = input.int(50, "Higher-TF Bias EMA",     minval=5, group=grpEma)
-htfTimeframe     = input.timeframe("60", "Higher-TF",      group=grpEma)
-pullbackLookback = input.int(5,  "Pullback Lookback (bars)", minval=1, group=grpEma)
-pullbackTolAtr   = input.float(0.15, "Pullback Tolerance (ATR)", step=0.05, group=grpEma,
-                               tooltip="How close price must come to slow EMA to count as pullback")
+// ── Mean-Reversion Setup ────────────────────────────────────────────────────
+grpMR             = "Mean-Reversion Setup"
+bbLen             = input.int(20,   "BB Length",            minval=5, group=grpMR)
+bbMult            = input.float(2.0, "BB StdDev",           step=0.1, group=grpMR)
+rsiLen            = input.int(14,   "RSI Length",           minval=2, group=grpMR)
+rsiOversold       = input.float(25, "RSI Oversold",         step=1, group=grpMR)
+rsiOverbought     = input.float(75, "RSI Overbought",       step=1, group=grpMR)
+useReversalCandle = input.bool(true, "Require Reversal Candle", group=grpMR,
+                               tooltip="Wait for bullish/bearish confirmation candle (avoid knife-catching)")
+
+// ── Regime Filter (only fade in ranges) ─────────────────────────────────────
+grpRegime         = "Trend Regime Filter"
+useAdxFilter      = input.bool(true, "Use ADX Range Filter", group=grpRegime,
+                               tooltip="Skip if higher-TF is trending (ADX > threshold)")
+adxLen            = input.int(14,   "ADX Length",           minval=2, group=grpRegime)
+adxMaxThreshold   = input.float(25, "ADX Max for Range",    step=1, group=grpRegime,
+                                tooltip="Trade only if 1H ADX is BELOW this. >25 = trending market = skip.")
+adxTimeframe      = input.timeframe("60", "ADX Timeframe",  group=grpRegime)
 
 // ── Risk ────────────────────────────────────────────────────────────────────
 grpRisk          = "Risk Management"
 atrLen           = input.int(14,    "ATR Length",            minval=1, group=grpRisk)
-slAtrMult        = input.float(1.0, "SL: ATR Multiplier",    step=0.1, group=grpRisk,
-                               tooltip="Stop = entry ± (ATR × this)")
-rrRatio          = input.float(1.5, "TP Risk-Reward Ratio",  step=0.1, group=grpRisk)
+slAtrBuffer      = input.float(0.5, "SL Buffer Beyond Wick (ATR)", step=0.05, group=grpRisk)
+useBbMiddleTp    = input.bool(true, "TP at BB Middle (mean)", group=grpRisk,
+                              tooltip="True: TP at BB middle. False: TP at fixed R:R below.")
+rrRatio          = input.float(1.0, "Fixed TP R:R (if not BB middle)", step=0.1, group=grpRisk)
 maxTradesPerDay  = input.int(8,     "Max Trades / Day",      minval=1, group=grpRisk)
 
 // ── Volatility / News Filters ───────────────────────────────────────────────
 grpVol           = "Volatility & News Filters"
 useAtrSpikeBlk   = input.bool(true,  "Block ATR Spikes",        group=grpVol)
-atrSpikeMult     = input.float(2.0,  "ATR Spike Multiplier",    step=0.1, group=grpVol,
-                               tooltip="Skip if current ATR > avg ATR × this (news event in progress)")
+atrSpikeMult     = input.float(2.0,  "ATR Spike Multiplier",    step=0.1, group=grpVol)
 atrAvgLen        = input.int(50,     "ATR Average Length",      minval=10, group=grpVol)
 useAtrFloor      = input.bool(true,  "ATR Floor (skip dead vol)", group=grpVol)
-atrFloorPct      = input.float(0.5,  "ATR Floor (% of avg ATR)", step=0.05, group=grpVol,
-                               tooltip="Skip if ATR < avg ATR × this (chop / dead market)")
+atrFloorPct      = input.float(0.5,  "ATR Floor (% of avg)",    step=0.05, group=grpVol)
 
 useNewsBlock     = input.bool(true, "Block Hardcoded News Times", group=grpVol)
-nfpHourUtc       = input.int(13, "NFP/CPI Hour (UTC)",       minval=0, maxval=23, group=grpVol,
-                              tooltip="NFP & US CPI typically 13:30 UTC. Blocks 13:00-15:00 UTC on impact days.")
-fomcHourUtc      = input.int(19, "FOMC Hour (UTC)",          minval=0, maxval=23, group=grpVol,
-                              tooltip="FOMC decisions ~19:00 UTC. Mostly outside Singapore session.")
-bojHourUtc       = input.int(3,  "BOJ Hour (UTC)",           minval=0, maxval=23, group=grpVol,
-                              tooltip="BOJ decisions can drop 02:00-05:00 UTC during Tokyo session.")
+nfpHourUtc       = input.int(13, "NFP/CPI Hour (UTC)",       minval=0, maxval=23, group=grpVol)
+bojHourUtc       = input.int(3,  "BOJ Hour (UTC)",           minval=0, maxval=23, group=grpVol)
 
 skipDates        = input.string("",
      "Manual News Days (YYYY-MM-DD, comma sep)",
      group=grpVol,
-     tooltip="Block trading on specific dates (FOMC, NFP, CPI). Example: 2026-05-15,2026-06-12")
+     tooltip="Block trading on specific dates. Example: 2026-05-15,2026-06-12")
 
-// ── Walk-Forward Period Detection ───────────────────────────────────────────
+// ── Walk-Forward Detection ──────────────────────────────────────────────────
 inSample    = time >= inSampleStart and time < inSampleEnd
 outOfSample = time >= inSampleEnd   and time < testEnd
 inTestRange = inSample or outOfSample
 
-// ── Time / Session Detection ────────────────────────────────────────────────
+// ── Time / Session ──────────────────────────────────────────────────────────
 curHour = hour(time, "UTC")
 curMin  = minute(time, "UTC")
-
 minutesSinceMidnight = curHour * 60 + curMin
-sessionStartMin      = sessionStart * 60
-sessionEndMin        = sessionEnd   * 60
+sessionStartMin = sessionStart * 60
+sessionEndMin   = sessionEnd   * 60
 
-inSession = minutesSinceMidnight >= sessionStartMin and minutesSinceMidnight < sessionEndMin
-
-// Buffer at session open
-afterOpenBuffer  = minutesSinceMidnight >= sessionStartMin + openBufferMin
-// Buffer at session close
+inSession         = minutesSinceMidnight >= sessionStartMin and minutesSinceMidnight < sessionEndMin
+afterOpenBuffer   = minutesSinceMidnight >= sessionStartMin + openBufferMin
 beforeCloseBuffer = minutesSinceMidnight < sessionEndMin - closeBufferMin
-// Block last N minutes of every hour
-hourCloseOk = curMin < (60 - hourCloseBlockMin)
+hourCloseOk       = curMin < (60 - hourCloseBlockMin)
+sessionTradeOk    = inSession and afterOpenBuffer and beforeCloseBuffer and hourCloseOk
 
-sessionTradeOk = inSession and afterOpenBuffer and beforeCloseBuffer and hourCloseOk
-
-// ── ATR & Volatility Filter ─────────────────────────────────────────────────
-atrVal    = ta.atr(atrLen)
-atrAvg    = ta.sma(atrVal, atrAvgLen)
-
+// ── ATR & Volatility ────────────────────────────────────────────────────────
+atrVal = ta.atr(atrLen)
+atrAvg = ta.sma(atrVal, atrAvgLen)
 atrSpikeOk = useAtrSpikeBlk ? (not na(atrAvg) and atrVal <= atrAvg * atrSpikeMult) : true
 atrFloorOk = useAtrFloor    ? (not na(atrAvg) and atrVal >= atrAvg * atrFloorPct)  : true
 volOk      = atrSpikeOk and atrFloorOk
 
 // ── News Time Filter ────────────────────────────────────────────────────────
-// First Friday of month detection (NFP)
-dayOfWeekVal = dayofweek(time, "UTC")
+dayOfWeekVal  = dayofweek(time, "UTC")
 dayOfMonthVal = dayofmonth(time, "UTC")
 isFirstFriday = dayOfWeekVal == dayofweek.friday and dayOfMonthVal <= 7
 
-// NFP/CPI: typically 13:30 UTC. Block 13:00-15:00 UTC on first Friday + every Wed (CPI)
 nfpWindow = isFirstFriday and curHour >= nfpHourUtc and curHour < nfpHourUtc + 2
-// CPI: usually mid-month Wednesday around 13:30 UTC. Conservative: block all Wednesdays 13-15 UTC
 cpiWindow = dayOfWeekVal == dayofweek.wednesday and curHour >= nfpHourUtc and curHour < nfpHourUtc + 2
-// FOMC: 8 times/year, hard to detect generically. Block via manual dates instead.
-// BOJ: ~8 times/year, block via manual dates. Conservative: skip all Tuesdays in 02:00-05:00 UTC range
-bojWindow = dayOfWeekVal == dayofweek.tuesday and curHour >= bojHourUtc and curHour < bojHourUtc + 2
-
+bojWindow = dayOfWeekVal == dayofweek.tuesday  and curHour >= bojHourUtc and curHour < bojHourUtc + 2
 newsTimeOk = useNewsBlock ? (not nfpWindow and not cpiWindow and not bojWindow) : true
 
 // ── Manual Date Blocker ─────────────────────────────────────────────────────
-// Build today's date string and check if it's in the skip list
 yearStr  = str.tostring(year(time, "UTC"))
 monthVal = month(time, "UTC")
 dayVal   = dayofmonth(time, "UTC")
 monthStr = monthVal < 10 ? "0" + str.tostring(monthVal) : str.tostring(monthVal)
 dayStr   = dayVal   < 10 ? "0" + str.tostring(dayVal)   : str.tostring(dayVal)
 todayStr = yearStr + "-" + monthStr + "-" + dayStr
-
 manualBlockOk = str.contains(skipDates, todayStr) ? false : true
 
-// ── Combined Filter Pass ────────────────────────────────────────────────────
-filtersOk = sessionTradeOk and volOk and newsTimeOk and manualBlockOk and inTestRange
+// ── Bollinger Band ──────────────────────────────────────────────────────────
+bbBasis = ta.sma(close, bbLen)
+bbDev   = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
 
-// ── EMAs ────────────────────────────────────────────────────────────────────
-emaFast = ta.ema(close, fastLen)
-emaSlow = ta.ema(close, slowLen)
+// ── RSI ─────────────────────────────────────────────────────────────────────
+rsiVal = ta.rsi(close, rsiLen)
 
-htfBias = request.security(syminfo.tickerid, htfTimeframe,
-                           ta.ema(close, htfBiasLen),
-                           lookahead=barmerge.lookahead_off)
+// ── ADX (regime filter, higher TF) ──────────────────────────────────────────
+// Pine v6 ta.dmi returns [diPlus, diMinus, adx]
+[_diPlus, _diMinus, adxLocal] = ta.dmi(adxLen, adxLen)
+adxHtf = request.security(syminfo.tickerid, adxTimeframe, adxLocal,
+                          lookahead=barmerge.lookahead_off)
+rangeRegimeOk = useAdxFilter ? (not na(adxHtf) and adxHtf < adxMaxThreshold) : true
 
-// ── Trend Definition ────────────────────────────────────────────────────────
-trendUp   = emaFast > emaSlow and not na(htfBias) and close > htfBias
-trendDown = emaFast < emaSlow and not na(htfBias) and close < htfBias
+// ── Reversal Candle Detection ───────────────────────────────────────────────
+bullishBody    = close > open
+bearishBody    = close < open
+candleRange    = high - low
+bodySize       = math.abs(close - open)
+lowerWick      = math.min(open, close) - low
+upperWick      = high - math.max(open, close)
 
-// ── Pullback Detection ──────────────────────────────────────────────────────
-// For longs: low has touched/come near slow EMA in the last N bars
-recentLow  = ta.lowest(low,  pullbackLookback)
-recentHigh = ta.highest(high, pullbackLookback)
+// Bullish hammer / pin: long lower wick, small body
+bullishPin     = lowerWick > bodySize * 1.5 and lowerWick > upperWick
+// Bearish shooting star: long upper wick, small body
+bearishPin     = upperWick > bodySize * 1.5 and upperWick > lowerWick
+// Bullish engulfing
+bullishEngulf  = (close > open and close[1] < open[1] and close > open[1] and open < close[1])
+// Bearish engulfing
+bearishEngulf  = (close < open and close[1] > open[1] and close < open[1] and open > close[1])
 
-pullbackTolerance = pullbackTolAtr * atrVal
-pullbackLong  = recentLow  <= emaSlow + pullbackTolerance
-pullbackShort = recentHigh >= emaSlow - pullbackTolerance
+bullReversal = bullishPin or bullishEngulf or (bullishBody and close > close[1])
+bearReversal = bearishPin or bearishEngulf or (bearishBody and close < close[1])
 
-// ── Entry Trigger ───────────────────────────────────────────────────────────
-// Bullish: close back above fast EMA with momentum (bullish body)
-bullishBody = close > open
-bearishBody = close < open
+// ── Mean Reversion Triggers ─────────────────────────────────────────────────
+// LONG: price wick below lower BB + RSI oversold + (optional) reversal candle
+priceTouchedLowerBb = low <= bbLower
+priceTouchedUpperBb = high >= bbUpper
 
-longTrigger  = trendUp   and pullbackLong  and close > emaFast and bullishBody and close > close[1]
-shortTrigger = trendDown and pullbackShort and close < emaFast and bearishBody and close < close[1]
+longTrigger  = priceTouchedLowerBb and rsiVal < rsiOversold   and
+               (useReversalCandle ? bullReversal : true) and
+               close > low  // current bar started recovering
+shortTrigger = priceTouchedUpperBb and rsiVal > rsiOverbought and
+               (useReversalCandle ? bearReversal : true) and
+               close < high
+
+// ── Combined Filters ────────────────────────────────────────────────────────
+filtersOk = sessionTradeOk and volOk and newsTimeOk and manualBlockOk and
+            rangeRegimeOk and inTestRange
 
 // ── Trades / Day Limit ──────────────────────────────────────────────────────
 var int tradesToday = 0
 newDayBar = ta.change(time("D")) != 0
 if newDayBar
     tradesToday := 0
-
 underTradeLimit = tradesToday < maxTradesPerDay
 
 // ── Final Signals ───────────────────────────────────────────────────────────
@@ -203,17 +213,17 @@ shortSignal = filtersOk and shortTrigger and underTradeLimit and strategy.positi
 
 // ── Entries ─────────────────────────────────────────────────────────────────
 if longSignal
-    sl = close - atrVal * slAtrMult
+    sl = low - atrVal * slAtrBuffer
     risk = close - sl
-    tp = close + risk * rrRatio
+    tp = useBbMiddleTp ? bbBasis : close + risk * rrRatio
     strategy.entry("Long", strategy.long)
     strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
     tradesToday += 1
 
 if shortSignal
-    sl = close + atrVal * slAtrMult
+    sl = high + atrVal * slAtrBuffer
     risk = sl - close
-    tp = close - risk * rrRatio
+    tp = useBbMiddleTp ? bbBasis : close - risk * rrRatio
     strategy.entry("Short", strategy.short)
     strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
     tradesToday += 1
@@ -222,31 +232,27 @@ if shortSignal
 if minutesSinceMidnight >= sessionEndMin and strategy.position_size != 0
     strategy.close_all(comment="Session End")
 
-// Close trades when leaving test window
 if not inTestRange and strategy.position_size != 0
     strategy.close_all(comment="Out of test window")
 
 // ── Plots ───────────────────────────────────────────────────────────────────
-plot(emaFast, "EMA Fast", color=color.new(color.aqua,   20), linewidth=1)
-plot(emaSlow, "EMA Slow", color=color.new(color.orange, 20), linewidth=2)
-plot(not na(htfBias) ? htfBias : na, "HTF Bias EMA",
-     color=color.new(color.purple, 30), linewidth=2, style=plot.style_circles)
+plot(bbBasis, "BB Mid",   color=color.new(color.yellow, 30), linewidth=1)
+plot(bbUpper, "BB Upper", color=color.new(color.red,    40), linewidth=1)
+plot(bbLower, "BB Lower", color=color.new(color.green,  40), linewidth=1)
+fill(plot(bbUpper, display=display.none), plot(bbLower, display=display.none),
+     color=color.new(color.aqua, 95))
 
-// Session background
 bgcolor(inSession ? color.new(color.blue, 96) : na, title="Singapore Session")
 bgcolor(outOfSample ? color.new(color.purple, 92) : na, title="Out-of-Sample")
 bgcolor((nfpWindow or cpiWindow or bojWindow) and useNewsBlock ? color.new(color.red, 90) : na,
         title="News Block")
+bgcolor(useAdxFilter and not rangeRegimeOk and inSession ? color.new(color.orange, 92) : na,
+        title="Trending (skip)")
 
-// Signals
 plotshape(longSignal,  style=shape.triangleup,   location=location.belowbar,
-          color=color.green, size=size.small, title="Scalp Long")
+          color=color.green, size=size.small, title="MR Long")
 plotshape(shortSignal, style=shape.triangledown, location=location.abovebar,
-          color=color.red,   size=size.small, title="Scalp Short")
-
-// Filter-fail markers (debug — uncomment to see why signals are rejected)
-// plotshape(longTrigger and not filtersOk, style=shape.xcross, location=location.belowbar,
-//           color=color.gray, size=size.tiny, title="Long blocked")
+          color=color.red,   size=size.small, title="MR Short")
 
 // ── Walk-Forward Performance Table ──────────────────────────────────────────
 var table perfTable = table.new(position.top_right, 3, 11,
@@ -290,7 +296,7 @@ if barstate.islastconfirmedhistory
     isPF       = isGrossL  > 0 ? isGrossW  / isGrossL  : (isGrossW  > 0 ? 999.0 : 0.0)
     oosPF      = oosGrossL > 0 ? oosGrossW / oosGrossL : (oosGrossW > 0 ? 999.0 : 0.0)
 
-    avgRiskPerTrade = atrVal * slAtrMult  // approx $/trade with 1 oz pos
+    avgRiskPerTrade = atrVal * (slAtrBuffer + 1.0)
     daysInTest = math.max(1, (testEnd - inSampleStart) / 86400000)
     avgTradesPerDay = (isTrades + oosTrades) / daysInTest
 
@@ -299,7 +305,7 @@ if barstate.islastconfirmedhistory
     table.cell(perfTable, 2, 0, "Out-of-Sample", text_color=color.aqua,   text_size=size.small)
 
     table.cell(perfTable, 0, 1, "Strategy",      text_color=color.gray,   text_size=size.small)
-    table.cell(perfTable, 1, 1, "5m Scalp",      text_color=color.yellow, text_size=size.small)
+    table.cell(perfTable, 1, 1, "5m MR Fade",    text_color=color.yellow, text_size=size.small)
     table.cell(perfTable, 2, 1, "Singapore",     text_color=color.yellow, text_size=size.small)
 
     table.cell(perfTable, 0, 2, "Trades",        text_color=color.gray,   text_size=size.small)
@@ -308,9 +314,9 @@ if barstate.islastconfirmedhistory
 
     table.cell(perfTable, 0, 3, "Win Rate",      text_color=color.gray,   text_size=size.small)
     table.cell(perfTable, 1, 3, str.tostring(isWinRate,  "#0.1") + "%",
-               text_color=isWinRate  >= 45 ? color.green : color.red, text_size=size.small)
+               text_color=isWinRate  >= 55 ? color.green : color.red, text_size=size.small)
     table.cell(perfTable, 2, 3, str.tostring(oosWinRate, "#0.1") + "%",
-               text_color=oosWinRate >= 45 ? color.green : color.red, text_size=size.small)
+               text_color=oosWinRate >= 55 ? color.green : color.red, text_size=size.small)
 
     table.cell(perfTable, 0, 4, "Net Profit",    text_color=color.gray,   text_size=size.small)
     table.cell(perfTable, 1, 4, str.tostring(isProfit,  "#,##0.00"),
@@ -341,12 +347,12 @@ if barstate.islastconfirmedhistory
 
     table.cell(perfTable, 0, 8, "Trades / Day",  text_color=color.gray,   text_size=size.small)
     table.cell(perfTable, 1, 8, str.tostring(avgTradesPerDay, "#0.00"),  text_color=color.white, text_size=size.small)
-    table.cell(perfTable, 2, 8, "(target: 3-6)", text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 2, 8, "(target: 2-5)", text_color=color.gray,   text_size=size.small)
 
     table.cell(perfTable, 0, 9, "Avg Risk/Trade", text_color=color.gray,  text_size=size.small)
     table.cell(perfTable, 1, 9, "$" + str.tostring(avgRiskPerTrade, "#0.00"),
                text_color=color.white, text_size=size.small)
-    table.cell(perfTable, 2, 9, "(target ~$10)", text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 2, 9, "(approx)",      text_color=color.gray,   text_size=size.small)
 
     table.cell(perfTable, 0, 10, "Max DD",       text_color=color.gray,   text_size=size.small)
     table.cell(perfTable, 1, 10, str.tostring(strategy.max_drawdown, "#,##0.00"),
