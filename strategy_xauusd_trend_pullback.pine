@@ -1,0 +1,300 @@
+// =============================================================================
+// Strategy 7: XAU/USD Multi-Timeframe Trend + Pullback Entry
+// =============================================================================
+// Concept: Gold trends PERSISTENTLY. The previous strategy failed because it
+//          fought trends with sweep-reversal logic. This strategy DOES THE
+//          OPPOSITE: align with higher-timeframe trend, enter on shallow
+//          pullbacks back IN the trend direction.
+//
+//          Why this fits XAU/USD specifically:
+//          - Gold has had multi-year directional moves driven by macro flows
+//          - Trends persist much longer than reversal strategies anticipate
+//          - Pullback entries get good R:R without timing the top/bottom
+//
+// Edge Components:
+//
+//   1. DAILY HTF BIAS (macro trend direction)
+//      Daily EMA50 vs EMA200 defines the dominant trend.
+//      Only trade in this direction. No counter-trend trades.
+//
+//   2. 4H STRUCTURE CONFIRMATION
+//      4H EMA20 vs EMA50 confirms intermediate trend agrees with daily.
+//      Both must align to even consider an entry.
+//
+//   3. ENTRY-TIMEFRAME PULLBACK
+//      Wait for price to retrace to the entry-TF EMA20.
+//      Entry only on a confirmation candle (engulfing/strong reversal)
+//      that indicates pullback is finishing.
+//
+//   4. ATR-ADAPTIVE RISK
+//      SL = swing low/high beyond entry + 0.5 ATR buffer.
+//      Initial TP = 2x risk. After 2R, trailing stop at 1.5 ATR.
+//      This lets winners run during real trends.
+//
+// Best timeframes: 1H (more trades) or 4H (cleaner, fewer trades)
+// Avoid: 15m (too noisy for trend strategies)
+//
+// Walk-forward testing built in — same as Strategy 6.
+// =============================================================================
+
+//@version=6
+strategy("XAU/USD Trend Pullback Pro", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.02,
+     process_orders_on_close=false,
+     calc_on_every_tick=false)
+
+// ── Walk-Forward Inputs ─────────────────────────────────────────────────────
+grpWFA        = "Walk-Forward Testing"
+inSampleStart = input.time(timestamp("2020-01-01T00:00:00"), "In-Sample Start", group=grpWFA)
+inSampleEnd   = input.time(timestamp("2024-01-01T00:00:00"), "In-Sample End / OOS Start", group=grpWFA)
+testEnd       = input.time(timestamp("2026-12-31T23:59:59"), "Test End",        group=grpWFA)
+
+// ── Trend Filter Inputs ─────────────────────────────────────────────────────
+grpTrend      = "Multi-Timeframe Trend"
+useDailyBias  = input.bool(true, "Use Daily EMA Bias",        group=grpTrend)
+dailyFastLen  = input.int(50,    "Daily Fast EMA",            minval=5, group=grpTrend)
+dailySlowLen  = input.int(200,   "Daily Slow EMA",            minval=20, group=grpTrend)
+use4hConfirm  = input.bool(true, "Use 4H Trend Confirmation", group=grpTrend)
+h4FastLen     = input.int(20,    "4H Fast EMA",               minval=5, group=grpTrend)
+h4SlowLen     = input.int(50,    "4H Slow EMA",               minval=10, group=grpTrend)
+
+// ── Pullback Entry Inputs ───────────────────────────────────────────────────
+grpEntry      = "Pullback Entry (Chart TF)"
+entryEmaLen   = input.int(20,    "Entry EMA (pullback target)", minval=5, group=grpEntry)
+pullbackAtrR  = input.float(0.3, "Min Pullback Depth (ATR)",   step=0.1, group=grpEntry,
+                            tooltip="Distance from entry EMA in ATR units; ensures actual pullback occurred")
+useEngulfing  = input.bool(true, "Require Engulfing Confirmation Candle", group=grpEntry)
+
+// ── Risk Management ─────────────────────────────────────────────────────────
+grpRisk       = "Risk Management"
+atrLen        = input.int(14,    "ATR Length",                 minval=1, group=grpRisk)
+slAtrMult     = input.float(1.5, "Stop Loss ATR Multiplier",   step=0.1, group=grpRisk)
+tpRrRatio     = input.float(2.0, "Initial TP (R:R)",           step=0.1, group=grpRisk)
+useTrailing   = input.bool(true, "Trail After Initial TP Hit", group=grpRisk)
+trailAtrMult  = input.float(2.0, "Trail Distance (ATR)",       step=0.1, group=grpRisk)
+maxPositions  = input.int(1,     "Max Concurrent Positions",   minval=1, group=grpRisk)
+
+// ── Walk-Forward Period Detection ───────────────────────────────────────────
+inSample    = time >= inSampleStart and time < inSampleEnd
+outOfSample = time >= inSampleEnd   and time < testEnd
+inTestRange = inSample or outOfSample
+
+// ── HTF Trend Filters (request.security for higher timeframes) ──────────────
+// Daily bias
+dailyFastEma = request.security(syminfo.tickerid, "D",
+                                ta.ema(close, dailyFastLen),
+                                lookahead=barmerge.lookahead_off)
+dailySlowEma = request.security(syminfo.tickerid, "D",
+                                ta.ema(close, dailySlowLen),
+                                lookahead=barmerge.lookahead_off)
+
+dailyBullish = useDailyBias ? (not na(dailyFastEma) and not na(dailySlowEma) and dailyFastEma > dailySlowEma) : true
+dailyBearish = useDailyBias ? (not na(dailyFastEma) and not na(dailySlowEma) and dailyFastEma < dailySlowEma) : true
+
+// 4H confirmation
+h4FastEma = request.security(syminfo.tickerid, "240",
+                             ta.ema(close, h4FastLen),
+                             lookahead=barmerge.lookahead_off)
+h4SlowEma = request.security(syminfo.tickerid, "240",
+                             ta.ema(close, h4SlowLen),
+                             lookahead=barmerge.lookahead_off)
+
+h4Bullish = use4hConfirm ? (not na(h4FastEma) and not na(h4SlowEma) and h4FastEma > h4SlowEma) : true
+h4Bearish = use4hConfirm ? (not na(h4FastEma) and not na(h4SlowEma) and h4FastEma < h4SlowEma) : true
+
+// Combined HTF bias
+trendBullish = dailyBullish and h4Bullish
+trendBearish = dailyBearish and h4Bearish
+
+// ── Chart-TF Entry Logic ────────────────────────────────────────────────────
+entryEma = ta.ema(close, entryEmaLen)
+atrVal   = ta.atr(atrLen)
+
+// Pullback detection: did price recently touch or cross the entry EMA?
+pullbackToEmaLong  = low  <= entryEma + pullbackAtrR * atrVal
+pullbackToEmaShort = high >= entryEma - pullbackAtrR * atrVal
+
+// Confirmation candle: bullish/bearish engulfing or strong reversal
+bullishEngulf = close > open and close[1] < open[1] and
+                close >= open[1] and open <= close[1]
+bullishHammer = close > open and (math.min(open, close) - low) > math.abs(close - open) * 1.5
+
+bearishEngulf = close < open and close[1] > open[1] and
+                close <= open[1] and open >= close[1]
+bearishStar   = close < open and (high - math.max(open, close)) > math.abs(close - open) * 1.5
+
+bullishCandle = useEngulfing ? (bullishEngulf or bullishHammer) : (close > open)
+bearishCandle = useEngulfing ? (bearishEngulf or bearishStar)   : (close < open)
+
+// ── Signals ─────────────────────────────────────────────────────────────────
+canTrade = inTestRange and strategy.opentrades < maxPositions
+
+longSignal  = canTrade and trendBullish and pullbackToEmaLong  and bullishCandle and close > entryEma
+shortSignal = canTrade and trendBearish and pullbackToEmaShort and bearishCandle and close < entryEma
+
+// ── Entries with ATR-Adaptive Stops ─────────────────────────────────────────
+var float longStopPrice  = na
+var float longTpPrice    = na
+var float shortStopPrice = na
+var float shortTpPrice   = na
+var bool  longHitTp1     = false
+var bool  shortHitTp1    = false
+
+if longSignal
+    swingLow  = math.min(low, low[1], low[2])
+    sl        = swingLow - slAtrMult * atrVal
+    risk      = close - sl
+    tp        = close + risk * tpRrRatio
+    longStopPrice := sl
+    longTpPrice   := tp
+    longHitTp1    := false
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+
+if shortSignal
+    swingHigh = math.max(high, high[1], high[2])
+    sl        = swingHigh + slAtrMult * atrVal
+    risk      = sl - close
+    tp        = close - risk * tpRrRatio
+    shortStopPrice := sl
+    shortTpPrice   := tp
+    shortHitTp1    := false
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+
+// ── Trailing Stop After Initial TP ──────────────────────────────────────────
+if useTrailing and strategy.position_size > 0
+    // Detect if we've passed initial TP (track price reaching tpPrice)
+    if not longHitTp1 and high >= longTpPrice
+        longHitTp1 := true
+    if longHitTp1
+        // Trail with ATR
+        newTrail = close - trailAtrMult * atrVal
+        longStopPrice := math.max(longStopPrice, newTrail)
+        strategy.exit("Long Trail", "Long", stop=longStopPrice)
+
+if useTrailing and strategy.position_size < 0
+    if not shortHitTp1 and low <= shortTpPrice
+        shortHitTp1 := true
+    if shortHitTp1
+        newTrail = close + trailAtrMult * atrVal
+        shortStopPrice := math.min(shortStopPrice, newTrail)
+        strategy.exit("Short Trail", "Short", stop=shortStopPrice)
+
+// Close trades when leaving test window (avoid OOS contamination)
+if not inTestRange and strategy.position_size != 0
+    strategy.close_all(comment="Out of test window")
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(entryEma, "Entry EMA", color=color.new(color.blue, 0), linewidth=2)
+plot(useDailyBias and not na(dailyFastEma) ? dailyFastEma : na, "Daily Fast EMA",
+     color=color.new(color.purple, 30), linewidth=1, style=plot.style_circles)
+plot(use4hConfirm and not na(h4FastEma) ? h4FastEma : na, "4H Fast EMA",
+     color=color.new(color.orange, 30), linewidth=1, style=plot.style_circles)
+
+// HTF trend background
+bgcolor(trendBullish and inTestRange ? color.new(color.green, 95)  : na, title="Bullish Bias")
+bgcolor(trendBearish and inTestRange ? color.new(color.red, 95)    : na, title="Bearish Bias")
+
+// Walk-forward period highlight
+bgcolor(outOfSample ? color.new(color.purple, 92) : na, title="Out-of-Sample")
+
+// Signal markers
+plotshape(longSignal,  style=shape.triangleup,   location=location.belowbar,
+          color=color.green, size=size.normal, title="Trend Buy")
+plotshape(shortSignal, style=shape.triangledown, location=location.abovebar,
+          color=color.red,   size=size.normal, title="Trend Sell")
+
+// ── Walk-Forward Performance Table ──────────────────────────────────────────
+var table perfTable = table.new(position.top_right, 3, 9,
+                                bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islastconfirmedhistory
+    float isProfit  = 0.0
+    int   isTrades  = 0
+    int   isWins    = 0
+    float isGrossW  = 0.0
+    float isGrossL  = 0.0
+    float oosProfit = 0.0
+    int   oosTrades = 0
+    int   oosWins   = 0
+    float oosGrossW = 0.0
+    float oosGrossL = 0.0
+
+    for i = 0 to strategy.closedtrades - 1
+        entryT = strategy.closedtrades.entry_time(i)
+        profit = strategy.closedtrades.profit(i)
+
+        if entryT < inSampleEnd
+            isProfit  += profit
+            isTrades  += 1
+            if profit > 0
+                isWins += 1
+                isGrossW += profit
+            else
+                isGrossL += math.abs(profit)
+        else
+            oosProfit += profit
+            oosTrades += 1
+            if profit > 0
+                oosWins += 1
+                oosGrossW += profit
+            else
+                oosGrossL += math.abs(profit)
+
+    isWinRate  = isTrades  > 0 ? isWins  / isTrades  * 100 : 0.0
+    oosWinRate = oosTrades > 0 ? oosWins / oosTrades * 100 : 0.0
+    isPF       = isGrossL  > 0 ? isGrossW  / isGrossL  : (isGrossW  > 0 ? 999.0 : 0.0)
+    oosPF      = oosGrossL > 0 ? oosGrossW / oosGrossL : (oosGrossW > 0 ? 999.0 : 0.0)
+
+    table.cell(perfTable, 0, 0, "Metric",        text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 1, 0, "In-Sample",     text_color=color.lime,   text_size=size.small)
+    table.cell(perfTable, 2, 0, "Out-of-Sample", text_color=color.aqua,   text_size=size.small)
+
+    table.cell(perfTable, 0, 1, "Strategy",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 1, "Trend+Pullback",text_color=color.yellow, text_size=size.small)
+    table.cell(perfTable, 2, 1, "WFA",           text_color=color.yellow, text_size=size.small)
+
+    table.cell(perfTable, 0, 2, "Trades",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(isTrades),  text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 2, 2, str.tostring(oosTrades), text_color=color.white, text_size=size.small)
+
+    table.cell(perfTable, 0, 3, "Win Rate",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(isWinRate,  "#0.1") + "%",
+               text_color=isWinRate  >= 50 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 3, str.tostring(oosWinRate, "#0.1") + "%",
+               text_color=oosWinRate >= 50 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 4, "Net Profit",    text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 4, str.tostring(isProfit,  "#,##0.00"),
+               text_color=isProfit  >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 4, str.tostring(oosProfit, "#,##0.00"),
+               text_color=oosProfit >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 5, "Profit Factor", text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(isPF,  "#0.00"),
+               text_color=isPF  >= 1.5 ? color.green : (isPF  >= 1.0 ? color.yellow : color.red), text_size=size.small)
+    table.cell(perfTable, 2, 5, str.tostring(oosPF, "#0.00"),
+               text_color=oosPF >= 1.5 ? color.green : (oosPF >= 1.0 ? color.yellow : color.red), text_size=size.small)
+
+    isRoi  = isProfit  / strategy.initial_capital * 100
+    oosRoi = oosProfit / strategy.initial_capital * 100
+    table.cell(perfTable, 0, 6, "ROI %",         text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(isRoi,  "#0.00") + "%",
+               text_color=isRoi  >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 6, str.tostring(oosRoi, "#0.00") + "%",
+               text_color=oosRoi >= 0 ? color.green : color.red, text_size=size.small)
+
+    wfaRatio = isPF > 0 ? oosPF / isPF * 100 : 0.0
+    wfaVerdict = wfaRatio >= 70 ? "STRONG EDGE" : wfaRatio >= 50 ? "VIABLE" : wfaRatio > 0 ? "OVERFIT" : "NO OOS DATA"
+    wfaColor   = wfaRatio >= 70 ? color.green : wfaRatio >= 50 ? color.yellow : color.red
+    table.cell(perfTable, 0, 7, "WFA Health",    text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 7, str.tostring(wfaRatio, "#0.0") + "%", text_color=wfaColor, text_size=size.small)
+    table.cell(perfTable, 2, 7, wfaVerdict,                            text_color=wfaColor, text_size=size.small)
+
+    table.cell(perfTable, 0, 8, "Max DD",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 8, str.tostring(strategy.max_drawdown, "#,##0.00"),
+               text_color=color.red, text_size=size.small)
+    table.cell(perfTable, 2, 8, "(combined)",    text_color=color.gray,   text_size=size.small)
