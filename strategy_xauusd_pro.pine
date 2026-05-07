@@ -1,0 +1,290 @@
+// =============================================================================
+// Strategy 6: XAU/USD Pro — AMD + Regime Filter + DXY + Walk-Forward
+// =============================================================================
+// Concept: Multi-confluence Smart Money strategy specifically designed for
+//          gold (XAU/USD), with built-in walk-forward testing to expose
+//          curve-fitting and validate real edge.
+//
+// Edge Components (each must be aligned to enter):
+//
+//   1. AMD SESSION STRUCTURE (microstructure edge)
+//      Asian session range = accumulation. London/NY sweeps it.
+//      Most institutional gold flow happens during London-NY overlap.
+//
+//   2. VOLATILITY REGIME FILTER (regime adaptation)
+//      Only trade when ADX >= 20 (trending market). Sweeps in choppy
+//      markets are noise; sweeps in trending markets are real reversals.
+//
+//   3. DXY CROSS-ASSET CONFIRMATION (macro alignment)
+//      Gold has ~-0.85 correlation with DXY. Long gold only when DXY is
+//      below its MA (USD weakness). Short gold only when DXY is above.
+//
+// Walk-Forward Testing:
+//   - Set "In-Sample End" date in inputs
+//   - Performance table shows IS vs OOS metrics SEPARATELY
+//   - If OOS performance < 50% of IS, the strategy is curve-fit
+//   - True edge survives walk-forward; noise does not
+//
+// Position Sizing: 1 oz per trade (roughly 0.01 lot for retail XAU/USD)
+//                  $10,000 starting capital
+// =============================================================================
+
+//@version=6
+strategy("XAU/USD Pro: AMD+Regime+DXY+WFA", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.02,
+     process_orders_on_close=false,
+     calc_on_every_tick=false)
+
+// ── Walk-Forward Inputs ─────────────────────────────────────────────────────
+grpWFA       = "Walk-Forward Testing"
+inSampleStart = input.time(timestamp("2020-01-01T00:00:00"), "In-Sample Start", group=grpWFA)
+inSampleEnd   = input.time(timestamp("2024-01-01T00:00:00"), "In-Sample End / OOS Start", group=grpWFA)
+testEnd       = input.time(timestamp("2026-12-31T23:59:59"), "Test End",         group=grpWFA)
+
+// ── Session Inputs (UTC) ────────────────────────────────────────────────────
+grpSession   = "Session Settings (UTC)"
+asianStart   = input.int(0,   "Asian Start (hour)",        minval=0, maxval=23, group=grpSession)
+asianEnd     = input.int(7,   "Asian End / London Open",   minval=0, maxval=23, group=grpSession)
+tradeEnd     = input.int(16,  "Trading Cutoff (NY close)", minval=0, maxval=23, group=grpSession)
+
+// ── Sweep / Risk Inputs (in DOLLARS, not pips, for gold) ────────────────────
+grpRisk      = "Sweep & Risk Management"
+minSweep     = input.float(0.5, "Min Sweep Beyond Range ($)", step=0.1, group=grpRisk)
+slBuffer     = input.float(0.3, "SL Buffer Beyond Wick ($)",  step=0.1, group=grpRisk)
+maxSlDollars = input.float(8.0, "Max Stop Loss ($)",          step=0.5, group=grpRisk)
+rrRatio      = input.float(3.0, "Reward-to-Risk Ratio",       step=0.1, group=grpRisk)
+
+// ── Regime Filter Inputs ────────────────────────────────────────────────────
+grpRegime    = "Volatility Regime Filter"
+useAdxFilter = input.bool(true, "Enable ADX Regime Filter",  group=grpRegime)
+adxLen       = input.int(14,    "ADX Length",                minval=1, group=grpRegime)
+adxMin       = input.float(20,  "Min ADX (trending market)", step=1, group=grpRegime)
+
+// ── DXY Confirmation Inputs ─────────────────────────────────────────────────
+grpDxy       = "DXY Cross-Asset Filter"
+useDxyFilter = input.bool(true,    "Enable DXY Filter",   group=grpDxy)
+dxySymbol    = input.symbol("TVC:DXY", "DXY Symbol",     group=grpDxy)
+dxyMaLen     = input.int(50,       "DXY MA Length",       minval=5, group=grpDxy)
+
+// ── Walk-Forward Period Detection ───────────────────────────────────────────
+inSample     = time >= inSampleStart and time < inSampleEnd
+outOfSample  = time >= inSampleEnd   and time < testEnd
+inTestRange  = inSample or outOfSample
+
+// ── Session Detection ───────────────────────────────────────────────────────
+currentHour = hour(time, "UTC")
+isAsian     = currentHour >= asianStart and currentHour < asianEnd
+isTradeTime = currentHour >= asianEnd   and currentHour < tradeEnd
+
+// ── Asian Range Tracking (Accumulation) ─────────────────────────────────────
+var float asianHigh   = na
+var float asianLow    = na
+var bool  rangeReady  = false
+var bool  tradedToday = false
+
+// Reset at Asian open
+if isAsian and not isAsian[1]
+    asianHigh   := high
+    asianLow    := low
+    rangeReady  := false
+    tradedToday := false
+
+// Build the range during Asian hours
+if isAsian
+    asianHigh := math.max(asianHigh, high)
+    asianLow  := math.min(asianLow, low)
+
+// Lock the range when Asian ends
+if not isAsian and isAsian[1]
+    rangeReady := true
+
+// ── Volatility Regime Filter (ADX) ──────────────────────────────────────────
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+trendingMarket = useAdxFilter ? adxVal >= adxMin : true
+
+// ── DXY Confirmation (cross-asset) ──────────────────────────────────────────
+// Pull DXY price and MA from the requested symbol on the same timeframe
+dxyClose = request.security(dxySymbol, timeframe.period, close,
+                            lookahead=barmerge.lookahead_off,
+                            ignore_invalid_symbol=true)
+dxyMa    = request.security(dxySymbol, timeframe.period,
+                            ta.sma(close, dxyMaLen),
+                            lookahead=barmerge.lookahead_off,
+                            ignore_invalid_symbol=true)
+
+// DXY weakness = bullish for gold; DXY strength = bearish for gold
+dxyBearish = useDxyFilter ? (not na(dxyClose) and not na(dxyMa) and dxyClose < dxyMa) : true
+dxyBullish = useDxyFilter ? (not na(dxyClose) and not na(dxyMa) and dxyClose > dxyMa) : true
+
+// ── Full Confluence Signal ──────────────────────────────────────────────────
+// LONG: in test range + Asian low swept + bullish reversal candle +
+//       trending regime + DXY weak (USD bearish)
+fullBullish = inTestRange and isTradeTime and rangeReady and not tradedToday and
+              low < asianLow - minSweep and
+              close > asianLow and
+              close > open and
+              trendingMarket and
+              dxyBearish
+
+// SHORT: in test range + Asian high swept + bearish reversal candle +
+//        trending regime + DXY strong (USD bullish)
+fullBearish = inTestRange and isTradeTime and rangeReady and not tradedToday and
+              high > asianHigh + minSweep and
+              close < asianHigh and
+              close < open and
+              trendingMarket and
+              dxyBullish
+
+// ── Entries ─────────────────────────────────────────────────────────────────
+if fullBullish
+    slDist = math.min(close - low + slBuffer, maxSlDollars)
+    sl     = close - slDist
+    tp     = close + slDist * rrRatio
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+    tradedToday := true
+
+if fullBearish
+    slDist = math.min(high - close + slBuffer, maxSlDollars)
+    sl     = close + slDist
+    tp     = close - slDist * rrRatio
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+    tradedToday := true
+
+// End-of-day cleanup
+if currentHour >= tradeEnd and strategy.position_size != 0
+    strategy.close_all(comment="Session End")
+
+// Close out trades when leaving test range (avoid contaminating IS/OOS)
+if not inTestRange and strategy.position_size != 0
+    strategy.close_all(comment="Out of test window")
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+asianHighPlot = plot(rangeReady ? asianHigh : na, "Asian High",
+                     color=color.new(color.red, 40),  style=plot.style_stepline, linewidth=2)
+asianLowPlot  = plot(rangeReady ? asianLow  : na, "Asian Low",
+                     color=color.new(color.green, 40), style=plot.style_stepline, linewidth=2)
+fill(asianHighPlot, asianLowPlot, color=color.new(color.gray, 92), title="Asian Range")
+
+// Background highlights
+bgcolor(isAsian          ? color.new(color.blue, 95)    : na, title="Accumulation Window")
+bgcolor(isTradeTime      ? color.new(color.orange, 97)  : na, title="Trade Window")
+bgcolor(inSample         ? color.new(color.green, 97)   : na, title="In-Sample Period")
+bgcolor(outOfSample      ? color.new(color.purple, 95)  : na, title="Out-of-Sample Period")
+bgcolor(not trendingMarket and inTestRange ? color.new(color.red, 96) : na, title="Choppy (filtered)")
+
+// Signal markers
+plotshape(fullBullish, style=shape.triangleup,   location=location.belowbar,
+          color=color.green, size=size.normal, title="Pro Buy")
+plotshape(fullBearish, style=shape.triangledown, location=location.abovebar,
+          color=color.red,   size=size.normal, title="Pro Sell")
+
+// ── Walk-Forward Performance Table ──────────────────────────────────────────
+// Tracks IS and OOS metrics separately by attributing each closed trade
+// to the period its entry timestamp falls into.
+
+var table perfTable = table.new(position.top_right, 3, 9,
+                                bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islastconfirmedhistory
+    // Aggregate IS / OOS metrics from closed trades
+    float isProfit  = 0.0
+    int   isTrades  = 0
+    int   isWins    = 0
+    float isGrossW  = 0.0
+    float isGrossL  = 0.0
+
+    float oosProfit = 0.0
+    int   oosTrades = 0
+    int   oosWins   = 0
+    float oosGrossW = 0.0
+    float oosGrossL = 0.0
+
+    for i = 0 to strategy.closedtrades - 1
+        entryT = strategy.closedtrades.entry_time(i)
+        profit = strategy.closedtrades.profit(i)
+
+        if entryT < inSampleEnd
+            isProfit  += profit
+            isTrades  += 1
+            if profit > 0
+                isWins += 1
+                isGrossW += profit
+            else
+                isGrossL += math.abs(profit)
+        else
+            oosProfit += profit
+            oosTrades += 1
+            if profit > 0
+                oosWins += 1
+                oosGrossW += profit
+            else
+                oosGrossL += math.abs(profit)
+
+    isWinRate  = isTrades  > 0 ? isWins  / isTrades  * 100 : 0.0
+    oosWinRate = oosTrades > 0 ? oosWins / oosTrades * 100 : 0.0
+    isPF       = isGrossL  > 0 ? isGrossW  / isGrossL  : (isGrossW  > 0 ? 999.0 : 0.0)
+    oosPF      = oosGrossL > 0 ? oosGrossW / oosGrossL : (oosGrossW > 0 ? 999.0 : 0.0)
+
+    // Header row
+    table.cell(perfTable, 0, 0, "Metric",          text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 1, 0, "In-Sample",       text_color=color.lime,   text_size=size.small)
+    table.cell(perfTable, 2, 0, "Out-of-Sample",   text_color=color.aqua,   text_size=size.small)
+
+    // Strategy
+    table.cell(perfTable, 0, 1, "Strategy",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 1, "XAU Pro",         text_color=color.yellow, text_size=size.small)
+    table.cell(perfTable, 2, 1, "WFA",             text_color=color.yellow, text_size=size.small)
+
+    // Trades
+    table.cell(perfTable, 0, 2, "Trades",          text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(isTrades),  text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 2, 2, str.tostring(oosTrades), text_color=color.white, text_size=size.small)
+
+    // Win Rate
+    table.cell(perfTable, 0, 3, "Win Rate",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(isWinRate,  "#0.1") + "%",
+               text_color=isWinRate  >= 50 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 3, str.tostring(oosWinRate, "#0.1") + "%",
+               text_color=oosWinRate >= 50 ? color.green : color.red, text_size=size.small)
+
+    // Net Profit
+    table.cell(perfTable, 0, 4, "Net Profit",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 4, str.tostring(isProfit,  "#,##0.00"),
+               text_color=isProfit  >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 4, str.tostring(oosProfit, "#,##0.00"),
+               text_color=oosProfit >= 0 ? color.green : color.red, text_size=size.small)
+
+    // Profit Factor
+    table.cell(perfTable, 0, 5, "Profit Factor",   text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(isPF,  "#0.00"),
+               text_color=isPF  >= 1.5 ? color.green : (isPF  >= 1.0 ? color.yellow : color.red), text_size=size.small)
+    table.cell(perfTable, 2, 5, str.tostring(oosPF, "#0.00"),
+               text_color=oosPF >= 1.5 ? color.green : (oosPF >= 1.0 ? color.yellow : color.red), text_size=size.small)
+
+    // ROI %
+    isRoi  = isProfit  / strategy.initial_capital * 100
+    oosRoi = oosProfit / strategy.initial_capital * 100
+    table.cell(perfTable, 0, 6, "ROI %",           text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(isRoi,  "#0.00") + "%",
+               text_color=isRoi  >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 6, str.tostring(oosRoi, "#0.00") + "%",
+               text_color=oosRoi >= 0 ? color.green : color.red, text_size=size.small)
+
+    // Walk-Forward Verdict
+    // OOS profit factor as % of IS — > 50% = real edge, < 50% = overfit
+    wfaRatio = isPF > 0 ? oosPF / isPF * 100 : 0.0
+    table.cell(perfTable, 0, 7, "WFA Health",      text_color=color.gray,   text_size=size.small)
+    wfaVerdict = wfaRatio >= 70 ? "STRONG EDGE" : wfaRatio >= 50 ? "VIABLE" : wfaRatio > 0 ? "OVERFIT" : "NO OOS DATA"
+    wfaColor   = wfaRatio >= 70 ? color.green : wfaRatio >= 50 ? color.yellow : color.red
+    table.cell(perfTable, 1, 7, str.tostring(wfaRatio, "#0.0") + "%", text_color=wfaColor, text_size=size.small)
+    table.cell(perfTable, 2, 7, wfaVerdict,                            text_color=wfaColor, text_size=size.small)
+
+    // Total Drawdown (overall, can't easily split by period)
+    table.cell(perfTable, 0, 8, "Total Max DD",    text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 8, str.tostring(strategy.max_drawdown, "#,##0.00"),
+               text_color=color.red, text_size=size.small)
+    table.cell(perfTable, 2, 8, "(combined)",      text_color=color.gray, text_size=size.small)
