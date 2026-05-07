@@ -1,0 +1,354 @@
+// =============================================================================
+// Strategy 9: XAU/USD 5m Scalping — EMA Pullback (Singapore Session)
+// =============================================================================
+// Concept: Trend-following micro-scalps on the 5m chart during Singapore hours.
+//          When higher-TF trend is up, scalp pullbacks to fast EMA. Mirror for
+//          shorts. Tight SL, 1:1.5 R:R, exit fast.
+//
+// Setup:
+//   - 5m EMA9 / EMA21 define short-term trend
+//   - 1H EMA50 defines higher-TF bias (must align)
+//   - Pullback: price wicks to EMA21 within last 5 bars
+//   - Trigger: 5m bar closes back above/below EMA9 with momentum
+//
+// Session: Singapore (01:00-09:00 UTC) — Asian liquidity, gold tends to range
+//          but also trends cleanly during Tokyo data releases.
+//
+// Filters:
+//   - No trades in first 15 min after session open  (spread/slippage)
+//   - No trades in last 30 min before session close (closing volatility)
+//   - No trades in last 10 min of any hour          (hourly close noise)
+//   - ATR spike block (current ATR > 2x avg ATR)    (news event)
+//   - ATR floor (skip if ATR too low)               (dead market / fakes)
+//   - Hardcoded high-impact news windows            (NFP, FOMC, BOJ, CPI)
+//   - Manual news day blocker (comma-separated dates)
+//
+// Risk:
+//   - SL: entry ± (ATR × slMult)
+//   - TP: 1.5R fixed (no trailing — scalps are in/out fast)
+//   - Position: 1 oz (= 0.01 lot equivalent for retail brokers)
+//   - Expected ~$10 risk per trade with default ATR settings
+//
+// Walk-forward testing built in (IS / OOS split + WFA Health verdict).
+// =============================================================================
+
+//@version=6
+strategy("XAU/USD 5m Scalp | EMA Pullback", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.02,
+     process_orders_on_close=false,
+     calc_on_every_tick=false,
+     pyramiding=0)
+
+// ── Walk-Forward Inputs ─────────────────────────────────────────────────────
+grpWFA        = "Walk-Forward Testing"
+inSampleStart = input.time(timestamp("2020-01-01T00:00:00"), "In-Sample Start", group=grpWFA)
+inSampleEnd   = input.time(timestamp("2024-01-01T00:00:00"), "IS End / OOS Start", group=grpWFA)
+testEnd       = input.time(timestamp("2026-12-31T23:59:59"), "Test End",          group=grpWFA)
+
+// ── Session Inputs (Singapore = UTC+8, so SGT 09:00-17:00 = UTC 01:00-09:00) ─
+grpSession        = "Singapore Session (UTC)"
+sessionStart      = input.int(1, "Session Start Hour (UTC)", minval=0, maxval=23, group=grpSession,
+                              tooltip="01:00 UTC = 09:00 Singapore")
+sessionEnd        = input.int(9, "Session End Hour (UTC)",   minval=0, maxval=23, group=grpSession,
+                              tooltip="09:00 UTC = 17:00 Singapore")
+openBufferMin     = input.int(15, "Skip First N Minutes",   minval=0, group=grpSession)
+closeBufferMin    = input.int(30, "Skip Last N Minutes",    minval=0, group=grpSession)
+hourCloseBlockMin = input.int(10, "Block Last N Min of Each Hour", minval=0, maxval=59, group=grpSession)
+
+// ── EMA Setup ───────────────────────────────────────────────────────────────
+grpEma           = "EMA Setup"
+fastLen          = input.int(9,  "Fast EMA (5m)",          minval=2, group=grpEma)
+slowLen          = input.int(21, "Slow EMA (5m)",          minval=2, group=grpEma)
+htfBiasLen       = input.int(50, "Higher-TF Bias EMA",     minval=5, group=grpEma)
+htfTimeframe     = input.timeframe("60", "Higher-TF",      group=grpEma)
+pullbackLookback = input.int(5,  "Pullback Lookback (bars)", minval=1, group=grpEma)
+pullbackTolAtr   = input.float(0.15, "Pullback Tolerance (ATR)", step=0.05, group=grpEma,
+                               tooltip="How close price must come to slow EMA to count as pullback")
+
+// ── Risk ────────────────────────────────────────────────────────────────────
+grpRisk          = "Risk Management"
+atrLen           = input.int(14,    "ATR Length",            minval=1, group=grpRisk)
+slAtrMult        = input.float(1.0, "SL: ATR Multiplier",    step=0.1, group=grpRisk,
+                               tooltip="Stop = entry ± (ATR × this)")
+rrRatio          = input.float(1.5, "TP Risk-Reward Ratio",  step=0.1, group=grpRisk)
+maxTradesPerDay  = input.int(8,     "Max Trades / Day",      minval=1, group=grpRisk)
+
+// ── Volatility / News Filters ───────────────────────────────────────────────
+grpVol           = "Volatility & News Filters"
+useAtrSpikeBlk   = input.bool(true,  "Block ATR Spikes",        group=grpVol)
+atrSpikeMult     = input.float(2.0,  "ATR Spike Multiplier",    step=0.1, group=grpVol,
+                               tooltip="Skip if current ATR > avg ATR × this (news event in progress)")
+atrAvgLen        = input.int(50,     "ATR Average Length",      minval=10, group=grpVol)
+useAtrFloor      = input.bool(true,  "ATR Floor (skip dead vol)", group=grpVol)
+atrFloorPct      = input.float(0.5,  "ATR Floor (% of avg ATR)", step=0.05, group=grpVol,
+                               tooltip="Skip if ATR < avg ATR × this (chop / dead market)")
+
+useNewsBlock     = input.bool(true, "Block Hardcoded News Times", group=grpVol)
+nfpHourUtc       = input.int(13, "NFP/CPI Hour (UTC)",       minval=0, maxval=23, group=grpVol,
+                              tooltip="NFP & US CPI typically 13:30 UTC. Blocks 13:00-15:00 UTC on impact days.")
+fomcHourUtc      = input.int(19, "FOMC Hour (UTC)",          minval=0, maxval=23, group=grpVol,
+                              tooltip="FOMC decisions ~19:00 UTC. Mostly outside Singapore session.")
+bojHourUtc       = input.int(3,  "BOJ Hour (UTC)",           minval=0, maxval=23, group=grpVol,
+                              tooltip="BOJ decisions can drop 02:00-05:00 UTC during Tokyo session.")
+
+skipDates        = input.string("",
+     "Manual News Days (YYYY-MM-DD, comma sep)",
+     group=grpVol,
+     tooltip="Block trading on specific dates (FOMC, NFP, CPI). Example: 2026-05-15,2026-06-12")
+
+// ── Walk-Forward Period Detection ───────────────────────────────────────────
+inSample    = time >= inSampleStart and time < inSampleEnd
+outOfSample = time >= inSampleEnd   and time < testEnd
+inTestRange = inSample or outOfSample
+
+// ── Time / Session Detection ────────────────────────────────────────────────
+curHour = hour(time, "UTC")
+curMin  = minute(time, "UTC")
+
+minutesSinceMidnight = curHour * 60 + curMin
+sessionStartMin      = sessionStart * 60
+sessionEndMin        = sessionEnd   * 60
+
+inSession = minutesSinceMidnight >= sessionStartMin and minutesSinceMidnight < sessionEndMin
+
+// Buffer at session open
+afterOpenBuffer  = minutesSinceMidnight >= sessionStartMin + openBufferMin
+// Buffer at session close
+beforeCloseBuffer = minutesSinceMidnight < sessionEndMin - closeBufferMin
+// Block last N minutes of every hour
+hourCloseOk = curMin < (60 - hourCloseBlockMin)
+
+sessionTradeOk = inSession and afterOpenBuffer and beforeCloseBuffer and hourCloseOk
+
+// ── ATR & Volatility Filter ─────────────────────────────────────────────────
+atrVal    = ta.atr(atrLen)
+atrAvg    = ta.sma(atrVal, atrAvgLen)
+
+atrSpikeOk = useAtrSpikeBlk ? (not na(atrAvg) and atrVal <= atrAvg * atrSpikeMult) : true
+atrFloorOk = useAtrFloor    ? (not na(atrAvg) and atrVal >= atrAvg * atrFloorPct)  : true
+volOk      = atrSpikeOk and atrFloorOk
+
+// ── News Time Filter ────────────────────────────────────────────────────────
+// First Friday of month detection (NFP)
+dayOfWeekVal = dayofweek(time, "UTC")
+dayOfMonthVal = dayofmonth(time, "UTC")
+isFirstFriday = dayOfWeekVal == dayofweek.friday and dayOfMonthVal <= 7
+
+// NFP/CPI: typically 13:30 UTC. Block 13:00-15:00 UTC on first Friday + every Wed (CPI)
+nfpWindow = isFirstFriday and curHour >= nfpHourUtc and curHour < nfpHourUtc + 2
+// CPI: usually mid-month Wednesday around 13:30 UTC. Conservative: block all Wednesdays 13-15 UTC
+cpiWindow = dayOfWeekVal == dayofweek.wednesday and curHour >= nfpHourUtc and curHour < nfpHourUtc + 2
+// FOMC: 8 times/year, hard to detect generically. Block via manual dates instead.
+// BOJ: ~8 times/year, block via manual dates. Conservative: skip all Tuesdays in 02:00-05:00 UTC range
+bojWindow = dayOfWeekVal == dayofweek.tuesday and curHour >= bojHourUtc and curHour < bojHourUtc + 2
+
+newsTimeOk = useNewsBlock ? (not nfpWindow and not cpiWindow and not bojWindow) : true
+
+// ── Manual Date Blocker ─────────────────────────────────────────────────────
+// Build today's date string and check if it's in the skip list
+yearStr  = str.tostring(year(time, "UTC"))
+monthVal = month(time, "UTC")
+dayVal   = dayofmonth(time, "UTC")
+monthStr = monthVal < 10 ? "0" + str.tostring(monthVal) : str.tostring(monthVal)
+dayStr   = dayVal   < 10 ? "0" + str.tostring(dayVal)   : str.tostring(dayVal)
+todayStr = yearStr + "-" + monthStr + "-" + dayStr
+
+manualBlockOk = str.contains(skipDates, todayStr) ? false : true
+
+// ── Combined Filter Pass ────────────────────────────────────────────────────
+filtersOk = sessionTradeOk and volOk and newsTimeOk and manualBlockOk and inTestRange
+
+// ── EMAs ────────────────────────────────────────────────────────────────────
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+
+htfBias = request.security(syminfo.tickerid, htfTimeframe,
+                           ta.ema(close, htfBiasLen),
+                           lookahead=barmerge.lookahead_off)
+
+// ── Trend Definition ────────────────────────────────────────────────────────
+trendUp   = emaFast > emaSlow and not na(htfBias) and close > htfBias
+trendDown = emaFast < emaSlow and not na(htfBias) and close < htfBias
+
+// ── Pullback Detection ──────────────────────────────────────────────────────
+// For longs: low has touched/come near slow EMA in the last N bars
+recentLow  = ta.lowest(low,  pullbackLookback)
+recentHigh = ta.highest(high, pullbackLookback)
+
+pullbackTolerance = pullbackTolAtr * atrVal
+pullbackLong  = recentLow  <= emaSlow + pullbackTolerance
+pullbackShort = recentHigh >= emaSlow - pullbackTolerance
+
+// ── Entry Trigger ───────────────────────────────────────────────────────────
+// Bullish: close back above fast EMA with momentum (bullish body)
+bullishBody = close > open
+bearishBody = close < open
+
+longTrigger  = trendUp   and pullbackLong  and close > emaFast and bullishBody and close > close[1]
+shortTrigger = trendDown and pullbackShort and close < emaFast and bearishBody and close < close[1]
+
+// ── Trades / Day Limit ──────────────────────────────────────────────────────
+var int tradesToday = 0
+newDayBar = ta.change(time("D")) != 0
+if newDayBar
+    tradesToday := 0
+
+underTradeLimit = tradesToday < maxTradesPerDay
+
+// ── Final Signals ───────────────────────────────────────────────────────────
+longSignal  = filtersOk and longTrigger  and underTradeLimit and strategy.position_size == 0
+shortSignal = filtersOk and shortTrigger and underTradeLimit and strategy.position_size == 0
+
+// ── Entries ─────────────────────────────────────────────────────────────────
+if longSignal
+    sl = close - atrVal * slAtrMult
+    risk = close - sl
+    tp = close + risk * rrRatio
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+    tradesToday += 1
+
+if shortSignal
+    sl = close + atrVal * slAtrMult
+    risk = sl - close
+    tp = close - risk * rrRatio
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+    tradesToday += 1
+
+// ── Force Flat at Session End ───────────────────────────────────────────────
+if minutesSinceMidnight >= sessionEndMin and strategy.position_size != 0
+    strategy.close_all(comment="Session End")
+
+// Close trades when leaving test window
+if not inTestRange and strategy.position_size != 0
+    strategy.close_all(comment="Out of test window")
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(emaFast, "EMA Fast", color=color.new(color.aqua,   20), linewidth=1)
+plot(emaSlow, "EMA Slow", color=color.new(color.orange, 20), linewidth=2)
+plot(not na(htfBias) ? htfBias : na, "HTF Bias EMA",
+     color=color.new(color.purple, 30), linewidth=2, style=plot.style_circles)
+
+// Session background
+bgcolor(inSession ? color.new(color.blue, 96) : na, title="Singapore Session")
+bgcolor(outOfSample ? color.new(color.purple, 92) : na, title="Out-of-Sample")
+bgcolor((nfpWindow or cpiWindow or bojWindow) and useNewsBlock ? color.new(color.red, 90) : na,
+        title="News Block")
+
+// Signals
+plotshape(longSignal,  style=shape.triangleup,   location=location.belowbar,
+          color=color.green, size=size.small, title="Scalp Long")
+plotshape(shortSignal, style=shape.triangledown, location=location.abovebar,
+          color=color.red,   size=size.small, title="Scalp Short")
+
+// Filter-fail markers (debug — uncomment to see why signals are rejected)
+// plotshape(longTrigger and not filtersOk, style=shape.xcross, location=location.belowbar,
+//           color=color.gray, size=size.tiny, title="Long blocked")
+
+// ── Walk-Forward Performance Table ──────────────────────────────────────────
+var table perfTable = table.new(position.top_right, 3, 11,
+                                bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islastconfirmedhistory
+    float isProfit  = 0.0
+    int   isTrades  = 0
+    int   isWins    = 0
+    float isGrossW  = 0.0
+    float isGrossL  = 0.0
+    float oosProfit = 0.0
+    int   oosTrades = 0
+    int   oosWins   = 0
+    float oosGrossW = 0.0
+    float oosGrossL = 0.0
+
+    for i = 0 to strategy.closedtrades - 1
+        entryT = strategy.closedtrades.entry_time(i)
+        profit = strategy.closedtrades.profit(i)
+
+        if entryT < inSampleEnd
+            isProfit  += profit
+            isTrades  += 1
+            if profit > 0
+                isWins += 1
+                isGrossW += profit
+            else
+                isGrossL += math.abs(profit)
+        else
+            oosProfit += profit
+            oosTrades += 1
+            if profit > 0
+                oosWins += 1
+                oosGrossW += profit
+            else
+                oosGrossL += math.abs(profit)
+
+    isWinRate  = isTrades  > 0 ? isWins  / isTrades  * 100 : 0.0
+    oosWinRate = oosTrades > 0 ? oosWins / oosTrades * 100 : 0.0
+    isPF       = isGrossL  > 0 ? isGrossW  / isGrossL  : (isGrossW  > 0 ? 999.0 : 0.0)
+    oosPF      = oosGrossL > 0 ? oosGrossW / oosGrossL : (oosGrossW > 0 ? 999.0 : 0.0)
+
+    avgRiskPerTrade = atrVal * slAtrMult  // approx $/trade with 1 oz pos
+    daysInTest = math.max(1, (testEnd - inSampleStart) / 86400000)
+    avgTradesPerDay = (isTrades + oosTrades) / daysInTest
+
+    table.cell(perfTable, 0, 0, "Metric",        text_color=color.white,  text_size=size.small)
+    table.cell(perfTable, 1, 0, "In-Sample",     text_color=color.lime,   text_size=size.small)
+    table.cell(perfTable, 2, 0, "Out-of-Sample", text_color=color.aqua,   text_size=size.small)
+
+    table.cell(perfTable, 0, 1, "Strategy",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 1, "5m Scalp",      text_color=color.yellow, text_size=size.small)
+    table.cell(perfTable, 2, 1, "Singapore",     text_color=color.yellow, text_size=size.small)
+
+    table.cell(perfTable, 0, 2, "Trades",        text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(isTrades),  text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 2, 2, str.tostring(oosTrades), text_color=color.white, text_size=size.small)
+
+    table.cell(perfTable, 0, 3, "Win Rate",      text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(isWinRate,  "#0.1") + "%",
+               text_color=isWinRate  >= 45 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 3, str.tostring(oosWinRate, "#0.1") + "%",
+               text_color=oosWinRate >= 45 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 4, "Net Profit",    text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 4, str.tostring(isProfit,  "#,##0.00"),
+               text_color=isProfit  >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 4, str.tostring(oosProfit, "#,##0.00"),
+               text_color=oosProfit >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 5, "Profit Factor", text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(isPF,  "#0.00"),
+               text_color=isPF  >= 1.3 ? color.green : (isPF  >= 1.0 ? color.yellow : color.red), text_size=size.small)
+    table.cell(perfTable, 2, 5, str.tostring(oosPF, "#0.00"),
+               text_color=oosPF >= 1.3 ? color.green : (oosPF >= 1.0 ? color.yellow : color.red), text_size=size.small)
+
+    isRoi  = isProfit  / strategy.initial_capital * 100
+    oosRoi = oosProfit / strategy.initial_capital * 100
+    table.cell(perfTable, 0, 6, "ROI %",         text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(isRoi,  "#0.00") + "%",
+               text_color=isRoi  >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 6, str.tostring(oosRoi, "#0.00") + "%",
+               text_color=oosRoi >= 0 ? color.green : color.red, text_size=size.small)
+
+    wfaRatio = isPF > 0 ? oosPF / isPF * 100 : 0.0
+    wfaVerdict = wfaRatio >= 70 ? "STRONG EDGE" : wfaRatio >= 50 ? "VIABLE" : wfaRatio > 0 ? "OVERFIT" : "NO OOS"
+    wfaColor   = wfaRatio >= 70 ? color.green : wfaRatio >= 50 ? color.yellow : color.red
+    table.cell(perfTable, 0, 7, "WFA Health",    text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 7, str.tostring(wfaRatio, "#0.0") + "%", text_color=wfaColor, text_size=size.small)
+    table.cell(perfTable, 2, 7, wfaVerdict,                            text_color=wfaColor, text_size=size.small)
+
+    table.cell(perfTable, 0, 8, "Trades / Day",  text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 8, str.tostring(avgTradesPerDay, "#0.00"),  text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 2, 8, "(target: 3-6)", text_color=color.gray,   text_size=size.small)
+
+    table.cell(perfTable, 0, 9, "Avg Risk/Trade", text_color=color.gray,  text_size=size.small)
+    table.cell(perfTable, 1, 9, "$" + str.tostring(avgRiskPerTrade, "#0.00"),
+               text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 2, 9, "(target ~$10)", text_color=color.gray,   text_size=size.small)
+
+    table.cell(perfTable, 0, 10, "Max DD",       text_color=color.gray,   text_size=size.small)
+    table.cell(perfTable, 1, 10, str.tostring(strategy.max_drawdown, "#,##0.00"),
+               text_color=color.red, text_size=size.small)
+    table.cell(perfTable, 2, 10, "(combined)",   text_color=color.gray,   text_size=size.small)
