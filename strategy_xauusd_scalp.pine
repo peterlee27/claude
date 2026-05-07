@@ -189,16 +189,11 @@ bearReversal = bearishPin or bearishEngulf or (bearishBody and close < close[1])
 priceTouchedLowerBb = low <= bbLower
 priceTouchedUpperBb = high >= bbUpper
 
-longTrigger  = priceTouchedLowerBb and rsiVal < rsiOversold   and
-               (useReversalCandle ? bullReversal : true) and
-               close > low  // current bar started recovering
-shortTrigger = priceTouchedUpperBb and rsiVal > rsiOverbought and
-               (useReversalCandle ? bearReversal : true) and
-               close < high
+longTrigger  = (priceTouchedLowerBb and rsiVal < rsiOversold and (useReversalCandle ? bullReversal : true) and close > low)
+shortTrigger = (priceTouchedUpperBb and rsiVal > rsiOverbought and (useReversalCandle ? bearReversal : true) and close < high)
 
 // ── Combined Filters ────────────────────────────────────────────────────────
-filtersOk = sessionTradeOk and volOk and newsTimeOk and manualBlockOk and
-            rangeRegimeOk and inTestRange
+filtersOk = (sessionTradeOk and volOk and newsTimeOk and manualBlockOk and rangeRegimeOk and inTestRange)
 
 // ── Trades / Day Limit ──────────────────────────────────────────────────────
 var int tradesToday = 0
